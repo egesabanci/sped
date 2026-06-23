@@ -1,80 +1,98 @@
 # ⚡ sped — Universal Speculative Decoding
 
-**sped** is a CLI toolkit for universal speculative decoding. It lets you pair
-**any small draft model** with **any large target model** — even if they use
-completely different tokenizers — and accelerate inference without any loss in
-output quality.
+**sped** pairs **any small draft model** with **any large target model** — even with completely different tokenizers — and accelerates inference **2–5×** with zero loss in output quality.
 
-## Features
+[![CI](https://github.com/egesabanci/sped/actions/workflows/ci.yml/badge.svg)](https://github.com/egesabanci/sped/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/sped)](https://pypi.org/project/sped/)
+[![Python](https://img.shields.io/pypi/pyversions/sped)](https://pypi.org/project/sped/)
+[![License](https://img.shields.io/pypi/l/sped)](https://github.com/egesabanci/sped/blob/main/LICENSE)
 
-- **🔀 Vocabulary-agnostic** — Draft and target models can use different
-  tokenizers. Powered by Intel/Weizmann heterogeneous SD algorithms.
-- **🎯 PEFT distillation** — Align any tiny draft model to any target model
-  with LoRA in under an hour on a single GPU.
-- **🔄 Online adaptation** — Draft keeps improving during inference via OSD.
-- **⚡ Universal** — Works with any Hugging Face model out of the box.
-- **🧪 Experiment CLI** — Quickly test draft-target pairs, measure acceptance
-  rates, and tune hyperparameters.
+## Install
+
+```bash
+uv pip install sped
+```
+
+Or from source:
+
+```bash
+git clone https://github.com/egesabanci/sped
+cd sped
+uv venv && uv pip install -e .
+```
 
 ## Quick Start
 
 ```bash
-# Install
-pip install sped
+# List recommended draft-target pairs
+sped list pairings
 
-# Distill a tiny draft to your target
-sped distill \
+# Run inference with speculation (same-vocab)
+sped serve run \
+  --target meta-llama/Llama-3.1-70B \
+  --draft meta-llama/Llama-3.2-1B
+
+# Cross-vocab (different tokenizers)
+sped serve run \
+  --target meta-llama/Llama-3.1-70B \
+  --draft Qwen/Qwen2.5-0.5B \
+  --align hybrid
+
+# Benchmark
+sped serve run --target meta-llama/Llama-3.1-70B --draft Qwen/Qwen2.5-0.5B --benchmark
+
+# Distill a draft model via PEFT
+sped distil run \
   --draft Qwen/Qwen2.5-0.5B \
   --target meta-llama/Llama-3.1-70B \
-  --lora-rank 8
+  --dataset HuggingFaceH4/ultrachat_200k
 
-# Run inference with speculation
-sped serve \
-  --target meta-llama/Llama-3.1-70B \
-  --draft ./distilled-draft \
-  --speedup 2.5x
+# Auto-tune draft K
+sped experiment auto-tune --target meta-llama/Llama-3.1-70B --draft Qwen/Qwen2.5-0.5B
 ```
+
+## Features
+
+| Feature | Description |
+|---------|-------------|
+| **🧠 Any model pair** | Works across tokenizers via Intel/Weizmann vocabulary-agnostic alignment |
+| **⚡ 2–5× speedup** | Lossless — output matches target model distribution exactly |
+| **🎯 PEFT distillation** | Align tiny draft models with LoRA in ~1 GPU-hour |
+| **🔄 Online adaptation** | Draft improves during inference via OSD |
+| **🍎 MLX backend** | Optimized for Apple Silicon (M1–M4) |
+| **🏭 vLLM support** | Production-grade serving (optional) |
+| **🧪 Experiment runner** | Grid-search, HTML reports, auto-tune |
 
 ## How It Works
 
 ```
-┌─────────────────────────────────────────────────────┐
-│  Tiny Draft Model (0.5B)                            │
-│    └─ PEFT (LoRA) to mimic target distribution      │
-│    └─ Proposes K tokens per step                    │
-└──────────┬──────────────────────────────────────────┘
-           │ draft tokens (possibly different vocab)
-           ▼
-┌─────────────────────────────────────────────────────┐
-│  Vocab-Agnostic Alignment Layer                     │
-│    └─ Maps draft tokens → target token space        │
-│    └─ Intel/Weizmann heterogeneous SD algorithms     │
-└──────────┬──────────────────────────────────────────┘
-           │ aligned draft tokens
-           ▼
-┌─────────────────────────────────────────────────────┐
-│  Large Target Model (70B)                           │
-│    └─ Verifies all K tokens in ONE forward pass     │
-│    └─ Rejection sampling → lossless acceleration     │
-└──────────┬──────────────────────────────────────────┘
-           │ online feedback
-           ▼
-┌─────────────────────────────────────────────────────┐
-│  Online Adapter (OSD)                               │
-│    └─ Updates LoRA weights based on accept/reject   │
-│    └─ Draft gets better over time                   │
-└─────────────────────────────────────────────────────┘
+Standard:    tok1 → tok2 → tok3 → tok4 → ...  (1 pass/token, slow)
+sped:        draft: [tok1 tok2 tok3 tok4]      (4 cheap passes)
+             target: ──────verify──────→ [✓✓✓✗]  (1 expensive pass)
+             → same output, 2–5× faster
 ```
 
-## Roadmap
+## Documentation
 
-- [x] Project scaffolding
-- [ ] Core speculative decoding engine
-- [ ] Vocabulary-agnostic alignment (Intel/Weizmann)
-- [ ] PEFT distillation pipeline (DistillSpec)
-- [ ] Online adaptation (OSD)
-- [ ] `sped serve` — production inference server
-- [ ] `sped experiment` — interactive experiment runner
+- [CLI Reference](docs/cli.md) — Full command reference
+- [User Guide](docs/guide.md) — Tutorials and best practices
+- [Architecture](docs/architecture.md) — System design and data flow
+- [Contributing](CONTRIBUTING.md) — Development guide
+
+## Backends
+
+```bash
+# HF Transformers (default, works everywhere)
+sped serve run --target meta-llama/Llama-3.1-70B --backend hf
+
+# MLX (Apple Silicon — 2–3× faster on Mac)
+uv pip install mlx-lm
+sped serve run --target mlx-community/Llama-3.2-3B --backend mlx
+
+# vLLM (production serving)
+uv pip install vllm
+sped serve run --target meta-llama/Llama-3.1-70B --backend vllm
+```
 
 ## License
 

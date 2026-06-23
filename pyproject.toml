@@ -9,6 +9,25 @@ description = "Universal speculative decoding — any draft model, any target mo
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"
+authors = [
+    { name = "Ege Sabanci", email = "egesabanci@gmail.com" },
+]
+keywords = [
+    "speculative-decoding", "llm-inference", "ai-acceleration",
+    "large-language-models", "machine-learning", "deep-learning",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
 dependencies = [
     "torch>=2.1.0",
     "transformers>=4.40.0",
@@ -19,28 +38,22 @@ dependencies = [
     "accelerate>=0.27.0",
 ]
 
+[project.urls]
+Homepage = "https://github.com/egesabanci/sped"
+Repository = "https://github.com/egesabanci/sped"
+Documentation = "https://github.com/egesabanci/sped/tree/main/docs"
+Issues = "https://github.com/egesabanci/sped/issues"
+
 [project.scripts]
 sped = "sped.cli.main:app"
 
+[project.optional-dependencies]
+mlx = ["mlx-lm>=0.20.0"]
+vllm = ["vllm>=0.6.0"]
+dev = ["pytest>=8.0.0", "pytest-cov>=5.0.0", "ruff>=0.4.0", "mypy>=1.8.0", "types-requests"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["sped"]
-
-[dependency-groups]
-dev = [
-    "pytest>=8.0.0",
-    "pytest-cov>=5.0.0",
-    "ruff>=0.4.0",
-    "mypy>=1.8.0",
-    "types-requests",
-]
-
-mlx = [
-    "mlx-lm>=0.20.0",
-]
-
-vllm = [
-    "vllm>=0.6.0",
-]
 
 [tool.ruff]
 target-version = "py310"
