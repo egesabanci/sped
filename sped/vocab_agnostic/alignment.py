@@ -199,7 +199,7 @@ class VocabAligner:
         mask = torch.tensor([alignment_masks], device=draft_token_ids.device)
         return result, mask
 
-    def _find_candidates(self, text: str, max_candidates: int = 10) -> list[tuple[int, str]]:
+    def _find_candidates(self, text: str, max_candidates: int = 5) -> list[tuple[int, str]]:
         """Find target vocabulary tokens that could represent this text."""
         text_lower = text.lower()
         candidates: list[tuple[int, str]] = []
@@ -235,32 +235,25 @@ class VocabAligner:
     ) -> torch.Tensor:
         """Score candidate target tokens using target model logits.
 
-        For each candidate, compute the target model's probability
-        at the next position given the context + aligned prefix.
+        Runs ONE forward pass and scores all candidates from the resulting
+        logits. Previously ran N forward passes (massive performance bug).
         """
         if self.target_model is None:
             return torch.ones(len(candidate_ids), device=context_ids.device)
 
         with torch.no_grad():
-            # Build input: context + prefix so far
             if prefix_so_far.dim() == 1:
                 prefix_so_far = prefix_so_far.unsqueeze(0)
 
-            # Score each candidate by computing its log-probability
-            scores = []
-            for cand_id in candidate_ids:
-                # Extend input with this candidate
-                extended = torch.cat([prefix_so_far, torch.tensor([[cand_id]], device=context_ids.device)], dim=-1)
-
-                # To avoid computing full forward pass per candidate,
-                # we approximate by looking at the logit for this token
-                # at the last position of the prefix
-                outputs = self.target_model(prefix_so_far)
-                logits_at_end = outputs.logits[0, -1, :]
-                prob = torch.softmax(logits_at_end, dim=-1)[cand_id]
-                scores.append(prob.item())
-
-            return torch.tensor(scores, device=context_ids.device)
+            # Single forward pass: all candidates scored from same logits
+            outputs = self.target_model(prefix_so_far)
+            logits_at_end = outputs.logits[0, -1, :]
+            probs = torch.softmax(logits_at_end, dim=-1)
+            scores = torch.tensor(
+                [probs[cid].item() for cid in candidate_ids],
+                device=context_ids.device,
+            )
+            return scores
 
     # ── Algorithm 3: Hybrid ───────────────────────────────────────────
 

@@ -184,38 +184,85 @@ class SpeculativeDecoder:
 
             # ── Step 2: Align draft tokens (if vocabs differ) ────────
             aligned_draft = draft_tensor
+            alignment_mask = None
             if self.vocab_aligner is not None:
                 try:
-                    aligned_draft, _ = self.vocab_aligner.align(
+                    aligned_draft, alignment_mask = self.vocab_aligner.align(
                         draft_tensor, torch.tensor([generated_ids], device=self.device),
                     )
                 except NotImplementedError:
                     pass
+                except Exception as e:
+                    # If alignment fails, fall back to standard generation for this step
+                    if verbose:
+                        print(f"  [align failed: {e}] falling back")
+                    aligned_draft = draft_tensor
+                    alignment_mask = None
 
             # ── Step 3: Verify all draft tokens in parallel ──────────
             ctx_tensor = torch.tensor([generated_ids], device=self.device)
             target_logits_for_draft = self.target_cache.verify_draft(ctx_tensor, aligned_draft.to(self.device))
 
-            if self.draft_cache is not None and self.vocab_aligner is None:
+            if self.vocab_aligner is not None and self.draft_model is not None:
+                # Cross-vocab: get draft logits in DRAFT vocabulary for the ORIGINAL draft tokens
                 draft_ctx = torch.tensor([draft_ctx_ids], device=self.device)
                 with torch.no_grad():
                     draft_output = self.draft_model(draft_ctx)
-                draft_logits = draft_output.logits[0, -(len(proposed_draft) + 1):-1, :]
-            else:
-                draft_logits = target_logits_for_draft.clone()
+                # Get logits at the original draft positions (in draft vocab)
+                draft_logits_original = draft_output.logits[0, -(len(proposed_draft) + 1):-1, :]
 
-            # ── Step 4: Rejection sampling ──────────────────────────
-            n_verify = min(aligned_draft.shape[-1], draft_logits.shape[0], target_logits_for_draft.shape[1])
-            try:
-                accepted_tokens, num_accepted = rejection_sample(
-                    draft_logits=draft_logits[:n_verify],
-                    target_logits=target_logits_for_draft[0, :n_verify],
-                    draft_tokens=aligned_draft[0, :n_verify],
-                    temperature=temperature,
-                )
-            except Exception:
-                accepted_tokens = []
-                num_accepted = 0
+                # Use heterogeneous rejection sampling
+                try:
+                    from sped.vocab_agnostic.heterogeneous import heterogeneous_rejection_sample
+                    accepted_tokens, num_accepted = heterogeneous_rejection_sample(
+                        draft_logits=draft_logits_original,
+                        target_logits=target_logits_for_draft[0],
+                        aligned_tokens=aligned_draft[0],
+                        alignment_mask=alignment_mask[0] if alignment_mask is not None else None,
+                        draft_tokens_original=draft_tensor[0],
+                        temperature=temperature,
+                    )
+                except Exception:
+                    # Fallback: standard rejection on aligned tokens
+                    draft_logits = target_logits_for_draft.clone()
+                    n_verify = min(aligned_draft.shape[-1], draft_logits.shape[0], target_logits_for_draft.shape[1])
+                    try:
+                        accepted_tokens, num_accepted = rejection_sample(
+                            draft_logits=draft_logits[:n_verify],
+                            target_logits=target_logits_for_draft[0, :n_verify],
+                            draft_tokens=aligned_draft[0, :n_verify],
+                            temperature=temperature,
+                        )
+                    except Exception:
+                        accepted_tokens, num_accepted = [], 0
+
+                # Skip the standard rejection below
+                _skip_standard_rejection = True
+            else:
+                _skip_standard_rejection = False
+
+            if not _skip_standard_rejection:
+                if self.draft_cache is not None and self.vocab_aligner is None:
+                    # Same vocab with draft cache
+                    draft_ctx = torch.tensor([draft_ctx_ids], device=self.device)
+                    with torch.no_grad():
+                        draft_output = self.draft_model(draft_ctx)
+                    draft_logits = draft_output.logits[0, -(len(proposed_draft) + 1):-1, :]
+                else:
+                    draft_logits = target_logits_for_draft.clone()
+
+                # ── Step 4: Rejection sampling ──────────────────────────
+                n_verify = min(aligned_draft.shape[-1], draft_logits.shape[0], target_logits_for_draft.shape[1])
+                try:
+                    accepted_tokens, num_accepted = rejection_sample(
+                        draft_logits=draft_logits[:n_verify],
+                        target_logits=target_logits_for_draft[0, :n_verify],
+                        draft_tokens=aligned_draft[0, :n_verify],
+                        temperature=temperature,
+                    )
+                except Exception:
+                    accepted_tokens = []
+                    num_accepted = 0
 
             # ── Step 5: Append accepted tokens ──────────────────────
             accepted_ids = accepted_tokens[:max_new_tokens - total_generated]

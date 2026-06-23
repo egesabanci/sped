@@ -130,6 +130,23 @@ class TestVocabAlignerHybrid:
         assert aligned_ids is not None
         assert mask is not None
 
+    def test_score_candidates_no_model(self):
+        """_score_candidates should return ones when no target model."""
+        from transformers import AutoTokenizer
+        from sped.vocab_agnostic.alignment import VocabAligner
+
+        tokenizer = AutoTokenizer.from_pretrained("hf-internal-testing/tiny-random-GPTNeoXForCausalLM")
+        aligner = VocabAligner(
+            target_tokenizer=tokenizer,
+            draft_tokenizer=tokenizer,
+            strategy="probabilistic",
+            target_model=None,
+        )
+        scores = aligner._score_candidates([1, 2, 3], torch.tensor([[1, 2, 3]]), torch.tensor([[1, 2, 3]]))
+        assert scores is not None
+        assert scores.shape[0] == 3
+        assert torch.all(scores == 1.0)
+
 
 # ── Strategy Selector Tests ──────────────────────────────
 
