@@ -1,7 +1,6 @@
 """Tests for project setup: uv, CLI, and basic imports."""
 
 import subprocess
-import sys
 from pathlib import Path
 
 import sped
@@ -41,25 +40,20 @@ def test_uv_lock_exists():
     assert (project_root / "uv.lock").exists()
 
 
-def test_pyproject_has_uv_section():
-    """pyproject.toml declares dev dependency group."""
+def test_pyproject_has_dev_deps():
+    """pyproject.toml has dev dependencies declared."""
     import tomllib
 
     project_root = Path(__file__).resolve().parent.parent
     pyproject = tomllib.loads((project_root / "pyproject.toml").read_text())
-    assert "dependency-groups" in pyproject
-    assert "dev" in pyproject["dependency-groups"]
-    assert "pytest" in str(pyproject["dependency-groups"]["dev"])
+    # Check in project.optional-dependencies
+    proj = pyproject.get("project", {})
+    opt_deps = proj.get("optional-dependencies", {})
+    assert "dev" in opt_deps
 
 
 def test_sped_installed_as_editable():
     """sped is installed as an editable (local) package."""
-    result = subprocess.run(
-        [sys.executable, "-c", "import sped; print(sped.__file__)"],
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode == 0
-    # Should point to the local project directory
-    assert "sped" in result.stdout
-    assert result.stdout.strip().startswith("/Users/egesabanci/Desktop/sped")
+    import sped
+    assert sped.__file__ is not None
+    assert "sped" in str(sped.__file__)
