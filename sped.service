@@ -1,0 +1,25 @@
+[Unit]
+Description=sped Speculative Decoding Server
+Documentation=https://github.com/egesabanci/sped/tree/main/docs
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu
+Environment=PATH=/home/ubuntu/sped-env/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+Environment=CUDA_VISIBLE_DEVICES=0
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/ubuntu/sped-env/bin/sped serve run --target Qwen/Qwen3-0.6B --device cuda --log-level info --log-file /var/log/sped/sped.log
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/var/log/sped/sped.log
+StandardError=append:/var/log/sped/sped.log
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
