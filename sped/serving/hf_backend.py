@@ -1,4 +1,7 @@
-"""Hugging Face Transformers backend for sped."""
+"""Hugging Face Transformers backend for sped.
+
+Supports CUDA, MPS, CPU auto-detection and AWQ/GPTQ/bitsandbytes quantization.
+"""
 
 from time import time
 from typing import Optional, Generator
@@ -8,6 +11,7 @@ from transformers import (
     AutoTokenizer,
     PreTrainedModel,
     PreTrainedTokenizer,
+    BitsAndBytesConfig,
 )
 
 from .base import InferenceBackend, BackendConfig, GenerationResult
@@ -24,6 +28,8 @@ class HFBackend(InferenceBackend):
         self._tokenizer: Optional[PreTrainedTokenizer] = None
         self._device: str = "cpu"
         self._max_length: int = 8192
+        self._param_count: Optional[float] = None
+        self._quantization: Optional[str] = None
 
     def load_model(self, config: BackendConfig):
         self._device = self._resolve_device(config.device)
@@ -32,23 +38,21 @@ class HFBackend(InferenceBackend):
         # Resolve dtype
         torch_dtype = self._resolve_dtype(config.dtype)
 
-        # Quantization
-        quantization_kwargs = {}
-        if config.quantization == "4bit":
-            quantization_kwargs = {
-                "load_in_4bit": True,
-                "bnb_4bit_compute_dtype": torch.bfloat16,
-            }
-        elif config.quantization == "8bit":
-            quantization_kwargs = {"load_in_8bit": True}
+        # Build quantization config
+        quantization_kwargs = self._build_quantization_kwargs(config.quantization)
 
         self._model = AutoModelForCausalLM.from_pretrained(
             config.model_id,
             torch_dtype=torch_dtype,
             device_map=self._device,
+            trust_remote_code=True,
             **quantization_kwargs,
         )
         self._model.eval()
+
+        # Track param count and quantization
+        self._param_count = sum(p.numel() for p in self._model.parameters()) / 1e9
+        self._quantization = config.quantization
 
         self._tokenizer = AutoTokenizer.from_pretrained(config.model_id)
         if self._tokenizer.pad_token is None:
@@ -96,8 +100,6 @@ class HFBackend(InferenceBackend):
         temperature: float,
     ) -> GenerationResult:
         """Stream tokens one at a time using model.generate with streamer."""
-        from transformers import TextStreamer
-
         inputs = self._tokenizer(prompt, return_tensors="pt").to(self._device)
         start = time()
 
@@ -136,6 +138,16 @@ class HFBackend(InferenceBackend):
     def device(self) -> str:
         return self._device
 
+    @property
+    def param_count(self) -> Optional[float]:
+        """Return parameter count in billions."""
+        return self._param_count
+
+    @property
+    def quantization(self) -> Optional[str]:
+        """Return quantization method used."""
+        return self._quantization
+
     def close(self):
         self._model = None
         self._tokenizer = None
@@ -144,12 +156,53 @@ class HFBackend(InferenceBackend):
 
     @staticmethod
     def _resolve_device(device: str) -> str:
+        """Resolve device string, trying CUDA -> MPS -> CPU.
+
+        Catches errors at each step so 'auto' never crashes.
+        """
         if device == "auto":
-            if torch.cuda.is_available():
-                return "cuda"
-            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                return "mps"
+            # Try CUDA
+            try:
+                if torch.cuda.is_available():
+                    return "cuda"
+            except Exception:
+                pass
+            # Try MPS
+            try:
+                if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                    return "mps"
+            except Exception:
+                pass
+            # Fallback to CPU
             return "cpu"
+
+        # Explicit device — validate it exists
+        if device.startswith("cuda"):
+            if not torch.cuda.is_available():
+                raise RuntimeError(
+                    f"Device '{device}' requested but CUDA is not available. "
+                    "Use --device cpu or install PyTorch with CUDA support."
+                )
+            if device == "cuda":
+                return "cuda"
+            # cuda:N — validate index
+            try:
+                idx = int(device.split(":")[1])
+                if idx >= torch.cuda.device_count():
+                    raise RuntimeError(
+                        f"CUDA device {idx} requested but only "
+                        f"{torch.cuda.device_count()} devices available."
+                    )
+            except (IndexError, ValueError):
+                raise RuntimeError(f"Invalid CUDA device spec: '{device}'. Use cuda:N or cuda.")
+
+        if device == "mps":
+            if not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
+                raise RuntimeError(
+                    "Device 'mps' requested but MPS is not available. "
+                    "Use --device cpu."
+                )
+
         return device
 
     @staticmethod
@@ -161,3 +214,35 @@ class HFBackend(InferenceBackend):
             "bfloat16": torch.bfloat16,
         }
         return mapping.get(dtype, "auto")
+
+    @staticmethod
+    def _build_quantization_kwargs(quantization: Optional[str]) -> dict:
+        """Build quantization kwargs for model loading.
+
+        Supports:
+        - '4bit' / '8bit': bitsandbytes quantization
+        - 'awq': AWQ (auto-detected from model config)
+        - 'gptq': GPTQ (auto-detected from model config)
+        - None: no quantization
+        """
+        if quantization is None:
+            return {}
+
+        if quantization == "4bit":
+            return {
+                "quantization_config": BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_compute_dtype=torch.bfloat16,
+                    bnb_4bit_use_double_quant=True,
+                ),
+            }
+        elif quantization == "8bit":
+            return {
+                "quantization_config": BitsAndBytesConfig(load_in_8bit=True),
+            }
+        elif quantization in ("awq", "gptq"):
+            # AWQ/GPTQ models are auto-detected by Transformers from
+            # their quantize_config.json. We just pass device_map.
+            return {}
+        else:
+            raise ValueError(f"Unknown quantization: {quantization}")

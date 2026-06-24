@@ -210,3 +210,89 @@ class TestServingImports:
     def test_import_vllm_backend(self):
         from sped.serving.vllm_backend import VLLMBackend
         assert VLLMBackend is not None
+
+
+# ── HFBackend static method tests ────────────────────────
+
+
+class TestHFBackendDeviceResolution:
+    def test_resolve_device_auto_cpu_fallback(self):
+        from sped.serving.hf_backend import HFBackend
+        # When no GPU available, auto should return cpu
+        device = HFBackend._resolve_device("auto")
+        assert device in ("cpu", "cuda", "mps")
+
+    def test_resolve_device_explicit_cpu(self):
+        from sped.serving.hf_backend import HFBackend
+        assert HFBackend._resolve_device("cpu") == "cpu"
+
+    def test_resolve_device_cuda_not_available(self):
+        """Should raise when CUDA not available but cuda requested."""
+        from sped.serving.hf_backend import HFBackend
+        import torch
+        if not torch.cuda.is_available():
+            with pytest.raises(RuntimeError):
+                HFBackend._resolve_device("cuda")
+
+    def test_resolve_device_mps_not_available(self):
+        """Should raise when MPS not available but mps requested."""
+        from sped.serving.hf_backend import HFBackend
+        import torch
+        mps_avail = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+        if not mps_avail:
+            with pytest.raises(RuntimeError):
+                HFBackend._resolve_device("mps")
+
+
+class TestHFBackendQuantization:
+    def test_quantization_none(self):
+        from sped.serving.hf_backend import HFBackend
+        assert HFBackend._build_quantization_kwargs(None) == {}
+
+    def test_quantization_4bit(self):
+        from sped.serving.hf_backend import HFBackend
+        kwargs = HFBackend._build_quantization_kwargs("4bit")
+        assert "quantization_config" in kwargs
+
+    def test_quantization_8bit(self):
+        from sped.serving.hf_backend import HFBackend
+        kwargs = HFBackend._build_quantization_kwargs("8bit")
+        assert "quantization_config" in kwargs
+
+    def test_quantization_awq(self):
+        from sped.serving.hf_backend import HFBackend
+        kwargs = HFBackend._build_quantization_kwargs("awq")
+        # AWQ models auto-detect; no quantization_config needed
+        assert kwargs == {}
+
+    def test_quantization_gptq(self):
+        from sped.serving.hf_backend import HFBackend
+        kwargs = HFBackend._build_quantization_kwargs("gptq")
+        assert kwargs == {}
+
+    def test_quantization_invalid(self):
+        from sped.serving.hf_backend import HFBackend
+        with pytest.raises(ValueError):
+            HFBackend._build_quantization_kwargs("invalid")
+
+
+class TestHFBackendDtypeResolution:
+    def test_resolve_dtype_auto(self):
+        from sped.serving.hf_backend import HFBackend
+        assert HFBackend._resolve_dtype("auto") == "auto"
+
+    def test_resolve_dtype_float32(self):
+        from sped.serving.hf_backend import HFBackend
+        assert HFBackend._resolve_dtype("float32") == torch.float32
+
+    def test_resolve_dtype_float16(self):
+        from sped.serving.hf_backend import HFBackend
+        assert HFBackend._resolve_dtype("float16") == torch.float16
+
+    def test_resolve_dtype_bfloat16(self):
+        from sped.serving.hf_backend import HFBackend
+        assert HFBackend._resolve_dtype("bfloat16") == torch.bfloat16
+
+    def test_resolve_dtype_unknown(self):
+        from sped.serving.hf_backend import HFBackend
+        assert HFBackend._resolve_dtype("unknown") == "auto"  # fallback

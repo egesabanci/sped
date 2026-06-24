@@ -38,3 +38,4 @@ site/
 .coverage
 htmlcov/
 .pytest_cache/
+benchmark_results.json

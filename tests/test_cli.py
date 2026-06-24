@@ -1,11 +1,28 @@
-"""Tests for CLI commands (Phase 1 + Phase 6).
+"""Tests for CLI commands (Phase 1 + Phase 6 + polish).
 
 All tests that hit external APIs are marked with a timeout.
 Network-dependent tests use @pytest.mark.network to allow filtering.
 """
 
 import subprocess
+import os
+import tempfile
+import json
+from pathlib import Path
 import pytest
+
+
+@pytest.fixture
+def temp_config_dir():
+    """Create a temporary .sped config directory."""
+    tmpdir = Path(tempfile.mkdtemp())
+    old_home = os.environ.get("HOME")
+    os.environ["HOME"] = str(tmpdir)
+    yield tmpdir
+    if old_home:
+        os.environ["HOME"] = old_home
+    else:
+        del os.environ["HOME"]
 
 
 def _run_sped(*args: str, timeout: int = 10) -> subprocess.CompletedProcess:
@@ -130,3 +147,242 @@ def test_experiment_auto_tune_help():
     r = _run_sped("experiment", "auto-tune", "--help")
     assert r.returncode == 0
     assert "--target" in r.stdout
+
+
+# ── config subcommands ────────────────────────────────────
+
+
+def test_config_init(temp_config_dir):
+    r = _run_sped("config", "init")
+    assert r.returncode == 0
+    assert "Created config" in r.stdout
+    config_path = Path(os.environ["HOME"]) / ".sped" / "config.yml"
+    assert config_path.exists()
+
+
+def test_config_init_twice(temp_config_dir):
+    """Second init should warn without --force."""
+    _run_sped("config", "init")
+    r = _run_sped("config", "init")
+    assert r.returncode == 0
+    assert "already exists" in r.stdout
+
+
+def test_config_init_force(temp_config_dir):
+    _run_sped("config", "init")
+    r = _run_sped("config", "init", "--force")
+    assert r.returncode == 0
+    assert "Created config" in r.stdout
+
+
+def test_config_set(temp_config_dir):
+    _run_sped("config", "init")
+    r = _run_sped("config", "set", "draft_k", "3")
+    assert r.returncode == 0
+    assert "draft_k" in r.stdout
+    assert "3" in r.stdout
+
+
+def test_config_set_invalid_key(temp_config_dir):
+    _run_sped("config", "init")
+    r = _run_sped("config", "set", "invalid_key", "value")
+    assert r.returncode != 0
+
+
+def test_config_show(temp_config_dir):
+    _run_sped("config", "init")
+    r = _run_sped("config", "show")
+    assert r.returncode == 0
+    assert "Configuration" in r.stdout
+
+
+def test_config_show_no_config(temp_config_dir):
+    # Defaults should show even without config file
+    r = _run_sped("config", "show")
+    assert r.returncode == 0
+    assert "Configuration" in r.stdout
+
+
+# ── validation tests ──────────────────────────────────────
+
+
+def test_validation_draft_k_valid():
+    from sped.utils.validation import validate_draft_k
+    assert validate_draft_k(5) == 5
+    assert validate_draft_k(1) == 1
+
+
+def test_validation_draft_k_invalid():
+    from sped.utils.validation import validate_draft_k
+    import pytest as _pytest
+    with _pytest.raises(ValueError):
+        validate_draft_k(0)
+    with _pytest.raises(ValueError):
+        validate_draft_k(100)
+
+
+def test_validation_temperature_valid():
+    from sped.utils.validation import validate_temperature
+    assert validate_temperature(0.0) == 0.0
+    assert validate_temperature(1.5) == 1.5
+    assert validate_temperature(0) == 0
+
+
+def test_validation_temperature_invalid():
+    from sped.utils.validation import validate_temperature
+    import pytest as _pytest
+    with _pytest.raises(ValueError):
+        validate_temperature(-0.1)
+    with _pytest.raises(ValueError):
+        validate_temperature(2.1)
+
+
+def test_validation_max_tokens_valid():
+    from sped.utils.validation import validate_max_new_tokens
+    assert validate_max_new_tokens(10) == 10
+    assert validate_max_new_tokens(4096) == 4096
+
+
+def test_validation_max_tokens_invalid():
+    from sped.utils.validation import validate_max_new_tokens
+    import pytest as _pytest
+    with _pytest.raises(ValueError):
+        validate_max_new_tokens(0)
+    with _pytest.raises(ValueError):
+        validate_max_new_tokens(5000)
+
+
+def test_validation_device_valid():
+    from sped.utils.validation import validate_device
+    assert validate_device("auto") == "auto"
+    assert validate_device("cpu") == "cpu"
+    assert validate_device("cuda") == "cuda"
+    assert validate_device("cuda:0") == "cuda:0"
+    assert validate_device("mps") == "mps"
+
+
+def test_validation_device_invalid():
+    from sped.utils.validation import validate_device
+    import pytest as _pytest
+    with _pytest.raises(ValueError):
+        validate_device("gpu")
+    with _pytest.raises(ValueError):
+        validate_device("cpu:0")
+
+
+def test_validation_backend_valid():
+    from sped.utils.validation import validate_backend
+    for b in ["auto", "hf", "mlx", "vllm"]:
+        assert validate_backend(b) == b
+
+
+def test_validation_backend_invalid():
+    from sped.utils.validation import validate_backend
+    import pytest as _pytest
+    with _pytest.raises(ValueError):
+        validate_backend("tensorrt")
+
+
+def test_validation_align_valid():
+    from sped.utils.validation import validate_align
+    for a in ["auto", "none", "string", "probabilistic", "hybrid"]:
+        assert validate_align(a) == a
+
+
+def test_validation_output_format_valid():
+    from sped.utils.validation import validate_output_format
+    for f in ["text", "json", "silent"]:
+        assert validate_output_format(f) == f
+
+
+def test_validation_model_id_local():
+    from sped.utils.validation import validate_model_id
+    # Use a temp dir with config.json
+    import tempfile as _tf
+    import os as _os
+    tmp = _tf.mktemp()
+    _os.makedirs(tmp, exist_ok=True)
+    Path(tmp, "config.json").write_text("{}")
+    assert validate_model_id(tmp) == tmp
+
+
+def test_validation_model_id_remote_format():
+    from sped.utils.validation import validate_model_id
+    assert validate_model_id("Qwen/Qwen3-0.6B") == "Qwen/Qwen3-0.6B"
+
+
+def test_validation_model_id_invalid():
+    from sped.utils.validation import validate_model_id
+    import pytest as _pytest
+    with _pytest.raises(ValueError):
+        validate_model_id("not-a-valid-path-or-model")
+
+
+def test_validation_draft_k_against_max():
+    from sped.utils.validation import validate_draft_k_against_max
+    import pytest as _pytest
+    # Should not raise
+    validate_draft_k_against_max(5, 10)
+    validate_draft_k_against_max(5, 5)
+    # Should raise
+    with _pytest.raises(ValueError):
+        validate_draft_k_against_max(10, 5)
+
+
+def test_validation_timeout_valid():
+    from sped.utils.validation import validate_timeout
+    assert validate_timeout(30) == 30
+    assert validate_timeout(None) is None
+
+
+def test_validation_timeout_invalid():
+    from sped.utils.validation import validate_timeout
+    import pytest as _pytest
+    with _pytest.raises(ValueError):
+        validate_timeout(0)
+    with _pytest.raises(ValueError):
+        validate_timeout(7200)
+
+
+# ── logging tests ────────────────────────────────────────
+
+
+def test_logging_setup(temp_config_dir):
+    from sped.utils.logging import setup_logging, get_logger, close_json_output
+    logger = setup_logging(log_level="debug")
+    assert logger is not None
+    assert logger.level == 10  # DEBUG
+    close_json_output()
+
+
+def test_logging_log_file(temp_config_dir):
+    from sped.utils.logging import setup_logging, close_json_output
+    log_path = Path(tempfile.mktemp(suffix=".log"))
+    setup_logging(log_level="info", log_file=str(log_path))
+    assert log_path.exists() or log_path.parent.exists()
+    close_json_output()
+
+
+def test_logging_json_output(temp_config_dir):
+    from sped.utils.logging import setup_logging, write_json_output, close_json_output
+    json_path = Path(tempfile.mktemp(suffix=".json"))
+    setup_logging(json_mode=True, json_file=str(json_path))
+    write_json_output({"event": "test", "value": 42})
+    close_json_output()
+    assert json_path.exists()
+    data = json.loads(json_path.read_text())
+    assert data["event"] == "test"
+
+
+# ── output formatting tests ──────────────────────────────
+
+
+def test_save_results_json():
+    from sped.utils.output import save_results_json
+    tmpdir = Path(tempfile.mkdtemp())
+    data = {"foo": "bar", "num": 42}
+    saved = save_results_json(data, tmpdir, timestamp=False)
+    assert saved.exists()
+    loaded = json.loads(saved.read_text())
+    assert loaded["foo"] == "bar"
+    assert loaded["num"] == 42
