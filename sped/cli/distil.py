@@ -79,6 +79,10 @@ def run(
         "auto", "--device",
         help="Device to use: auto, cuda, cpu, mps",
     ),
+    backend: str = typer.Option(
+        "auto", "--backend", "-b",
+        help="Backend: auto, hf, unsloth",
+    ),
 ):
     """Run PEFT distillation to align a draft model to a target model.
 
@@ -100,34 +104,74 @@ def run(
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # Load target model and tokenizer
-    rprint(f"\n[bold]Loading target model[/bold]: [cyan]{target}[/cyan]")
-    with Progress(
-        SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
-        transient=True,
-    ) as progress:
-        progress.add_task("Loading target model...", total=None)
-        target_tokenizer = AutoTokenizer.from_pretrained(target)
-        target_model = AutoModelForCausalLM.from_pretrained(
-            target, torch_dtype="auto", device_map=device
-        )
-        target_model.eval()
+    # Resolve backend
+    if backend == "auto":
+        try:
+            import unsloth  # noqa: F401
+            backend = "unsloth"
+        except ImportError:
+            backend = "hf"
 
-    rprint(f"  ✓ Target model loaded: [green]{sum(p.numel() for p in target_model.parameters()) / 1e9:.1f}B[/green] params")
+    if backend == "unsloth":
+        from unsloth import FastLanguageModel
 
-    # Load draft model and tokenizer
-    rprint(f"\n[bold]Loading draft model[/bold]: [cyan]{draft}[/cyan]")
-    with Progress(
-        SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
-        transient=True,
-    ) as progress:
-        progress.add_task("Loading draft model...", total=None)
-        draft_tokenizer = AutoTokenizer.from_pretrained(draft)
-        draft_model = AutoModelForCausalLM.from_pretrained(
-            draft, torch_dtype="auto", device_map=device
-        )
+        # Load target model via Unsloth
+        rprint(f"\n[bold]Loading target model (Unsloth)[/bold]: [cyan]{target}[/cyan]")
+        with Progress(
+            SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
+            transient=True,
+        ) as progress:
+            progress.add_task("Loading target model...", total=None)
+            target_model, target_tokenizer = FastLanguageModel.from_pretrained(
+                model_name=target,
+                max_seq_length=max_length,
+                dtype=None,
+                load_in_4bit=True,
+                device_map=device,
+            )
+            target_model.eval()
 
-    rprint(f"  ✓ Draft model loaded: [green]{sum(p.numel() for p in draft_model.parameters()) / 1e9:.1f}B[/green] params")
+        # Load draft model via Unsloth
+        rprint(f"\n[bold]Loading draft model (Unsloth)[/bold]: [cyan]{draft}[/cyan]")
+        with Progress(
+            SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
+            transient=True,
+        ) as progress:
+            progress.add_task("Loading draft model...", total=None)
+            draft_model, draft_tokenizer = FastLanguageModel.from_pretrained(
+                model_name=draft,
+                max_seq_length=max_length,
+                dtype=None,
+                load_in_4bit=True,
+                device_map=device,
+            )
+    else:
+        # Standard HF loading
+        rprint(f"\n[bold]Loading target model[/bold]: [cyan]{target}[/cyan]")
+        with Progress(
+            SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
+            transient=True,
+        ) as progress:
+            progress.add_task("Loading target model...", total=None)
+            target_tokenizer = AutoTokenizer.from_pretrained(target)
+            target_model = AutoModelForCausalLM.from_pretrained(
+                target, torch_dtype="auto", device_map=device
+            )
+            target_model.eval()
+
+        rprint(f"\n[bold]Loading draft model[/bold]: [cyan]{draft}[/cyan]")
+        with Progress(
+            SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
+            transient=True,
+        ) as progress:
+            progress.add_task("Loading draft model...", total=None)
+            draft_tokenizer = AutoTokenizer.from_pretrained(draft)
+            draft_model = AutoModelForCausalLM.from_pretrained(
+                draft, torch_dtype="auto", device_map=device
+            )
+
+    rprint(f"  ✓ Target: [green]{sum(p.numel() for p in target_model.parameters()) / 1e9:.1f}B[/green] params")
+    rprint(f"  ✓ Draft:  [green]{sum(p.numel() for p in draft_model.parameters()) / 1e9:.1f}B[/green] params")
 
     # Load dataset
     rprint(f"\n[bold]Loading dataset[/bold]: [cyan]{dataset}[/cyan]")
@@ -149,6 +193,7 @@ def run(
         lora_rank=lora_rank,
         lora_alpha=lora_alpha,
         device=device,
+        backend=backend,
     )
 
     # Run distillation
