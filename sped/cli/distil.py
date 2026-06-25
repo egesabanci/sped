@@ -98,9 +98,9 @@ def run(
         min=1, max=32,
     ),
     warmup_steps: int = typer.Option(
-        100, "--warmup-steps",
-        help="Linear LR warmup steps",
-        min=0,
+        -1, "--warmup-steps",
+        help="LR warmup steps (default -1 = auto: 5%% of total steps)",
+        min=-1,
     ),
     max_grad_norm: float = typer.Option(
         1.0, "--max-grad-norm",
@@ -126,6 +126,11 @@ def run(
         0.7, "--on-policy-temp",
         help="Generation temperature for on-policy data",
         min=0.0, max=2.0,
+    ),
+    on_policy_fraction: float = typer.Option(
+        0.25, "--on-policy-fraction",
+        help="Fraction of on-policy buffer to regenerate per cycle",
+        min=0.05, max=1.0,
     ),
     # ── Validation (issues #67, #77) ─────────────────────────────────
     validation_split: float = typer.Option(
@@ -308,6 +313,7 @@ def run(
         on_policy_regenerate_every=on_policy_regen_every,
         on_policy_tokens_per_prompt=on_policy_tokens_per_prompt,
         on_policy_gen_temp=on_policy_gen_temp,
+        on_policy_fraction=on_policy_fraction,
         validation_split=validation_split,
         val_prompts=val_prompts,
         val_draft_k=val_draft_k,
