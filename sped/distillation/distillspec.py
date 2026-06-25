@@ -469,9 +469,6 @@ class DistillSpec:
             accelerator.load_state(str(resume_from))
             logger.info(f"Resumed from checkpoint: {resume_from}")
 
-        # On-policy data buffer and rotation state (#102)
-        on_policy_buffer = None
-
         import time as _time
         _train_start = _time.time()
         _total_tokens = 0
@@ -505,36 +502,9 @@ class DistillSpec:
             for batch in train_loader:
                 with accelerator.accumulate(self.draft_model):
                     # ── Get texts from batch ──────────────────────────
-                    # batch is pre-tokenized dict with 'input_ids' key from _tokenize_dataset
                     input_ids = batch["input_ids"].to(accelerator.device)
                     _batch_tokens = input_ids.numel()
                     _total_tokens += _batch_tokens
-
-                    # ── On-policy data regeneration (#102) ───────────
-                    # Maintain a small rotating buffer of prompts (size = 4).
-                    # Each cycle, regenerate only on_policy_fraction of them.
-                    _OP_BUFFER_SIZE = 4
-                    if (global_step % on_policy_regenerate_every == 0) or on_policy_buffer is None:
-                        n_regen = max(1, int(_OP_BUFFER_SIZE * on_policy_fraction))
-                        gen_prompts = []
-                        for k in range(n_regen):
-                            idx = (self._on_policy_rotation_idx + k) % len(tokenized_data)
-                            gen_prompts.append(
-                                self.draft_tokenizer.decode(
-                                    tokenized_data[idx]["input_ids"][:64],
-                                    skip_special_tokens=True,
-                                )
-                            )
-                        self._on_policy_rotation_idx = (
-                            self._on_policy_rotation_idx + n_regen
-                        ) % len(tokenized_data)
-                        if gen_prompts:
-                            on_policy_buffer = self._generate_on_policy(
-                                gen_prompts,
-                                gen_temperature=on_policy_gen_temp,
-                                gen_tokens_per_prompt=on_policy_tokens_per_prompt,
-                                max_prompt_length=min(max_length, 512),  # cap for speed
-                            )
 
                     # ── Forward through both models ────────────────────
                     # batch is pre-tokenized with attention_mask from _collate_batch
