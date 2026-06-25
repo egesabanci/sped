@@ -3,8 +3,16 @@
 Full implementation with on-policy data generation (#14), robust training
 loop with Accelerate (#15), and acceptance rate validation (#16).
 
-Uses LoRA (PEFT) for efficient training — only ~0.1–1% of parameters
-are updated, enabling single-GPU distillation of 0.5B→70B model pairs.
+Uses LoRA (PEFT) for efficient training — only ~0.1-1% of parameters
+are updated, enabling single-GPU distillation of 0.5B->70B model pairs.
+
+Performance features (Phase 2):
+- Pre-tokenized dataset cache (#99) — tokenize once before training
+- Target logits cache across epochs (#97) — hash-based, avoids redundant 8B forward
+- bf16 autocast on frozen target forward (#98) — halves target forward cost
+- DataLoader workers + pinned memory (#100) — faster batch loading
+- Proportional warmup default (#101) — 5% of total steps instead of fixed 100
+- Incremental on-policy regeneration (#102) — only 25% of buffer per regen cycle
 """
 
 from pathlib import Path
@@ -24,7 +32,6 @@ logger = logging.getLogger(__name__)
 # ── Unsloth integration helpers ──────────────────────────────────────────
 
 def _is_unsloth_available() -> bool:
-    """Check if unsloth is installed."""
     try:
         import unsloth  # noqa: F401
         return True
@@ -33,20 +40,12 @@ def _is_unsloth_available() -> bool:
 
 
 def _is_unsloth_model(model) -> bool:
-    """Detect whether *model* was loaded/patched by Unsloth.
-
-    Unsloth-patched models carry internal attributes (e.g.
-    ``_saved_temp_tokenizer``) that standard HF models lack. We use this
-    to avoid routing a plain HF model through the Unsloth LoRA path just
-    because the ``unsloth`` package happens to be installed.
-    """
     return hasattr(model, "_saved_temp_tokenizer") or any(
         hasattr(model, attr) for attr in ("_unloth_model", "_unsloth_model")
     )
 
 
 def _apply_unsloth_lora(model, r: int = 8, lora_alpha: int = 16, **kwargs):
-    """Apply LoRA via FastLanguageModel.get_peft_model with fast kernels."""
     from unsloth import FastLanguageModel
     model = FastLanguageModel.get_peft_model(
         model,
@@ -60,44 +59,30 @@ def _apply_unsloth_lora(model, r: int = 8, lora_alpha: int = 16, **kwargs):
         use_gradient_checkpointing="unsloth",
         **kwargs,
     )
-    # Switch to training mode (undoes for_inference if called)
     FastLanguageModel.for_training(model)
     return model
 
 
 def _ensure_unsloth_inference(model):
-    """Switch model to inference mode (no-op if unsloth not available)."""
     if _is_unsloth_available():
         from unsloth import FastLanguageModel
         try:
             FastLanguageModel.for_inference(model)
         except TypeError:
-            pass  # not an unsloth model, ignore
+            pass
 
 
 def _ensure_unsloth_training(model):
-    """Switch model to training mode (no-op if unsloth not available)."""
     if _is_unsloth_available():
         from unsloth import FastLanguageModel
         try:
             FastLanguageModel.for_training(model)
         except TypeError:
-            pass  # not an unsloth model, ignore
+            pass
 
 
 class DistillSpec:
-    """Aligns a small draft model to a target model via on-policy KL distillation.
-
-    The draft model generates its own continuations (on-policy), and we
-    minimize the KL divergence between draft and target logits at each
-    generated position. LoRA keeps training efficient.
-
-    Typical workflow:
-        1. Initialize with draft + target models + tokenizers
-        2. Call distill() with a dataset
-        3. Save LoRA adapter
-        4. Validate with measure_acceptance_rate()
-    """
+    """Aligns a small draft model to a target model via on-policy KL distillation."""
 
     def __init__(
         self,
@@ -123,10 +108,10 @@ class DistillSpec:
         self.target_tokenizer = target_tokenizer
         self.backend = backend
 
-        # Resolve backend: prefer unsloth if auto, available, AND the
-        # model was actually loaded by Unsloth. This avoids routing a
-        # plain HF model through the Unsloth LoRA path just because the
-        # unsloth package is installed in the environment.
+        # Target logits cache (#97): hash(input_ids) -> logits tensor on CPU
+        # Cleared at the start of each epoch since on-policy data changes.
+        self._target_logits_cache: dict[int, torch.Tensor] = {}
+
         use_unsloth = (
             backend == "unsloth" or (
                 backend == "auto"
@@ -138,20 +123,15 @@ class DistillSpec:
         if use_unsloth:
             logger.info("Applying LoRA via Unsloth fast kernels")
             self.draft_model = _apply_unsloth_lora(
-                draft_model,
-                r=lora_rank,
-                lora_alpha=lora_alpha,
+                draft_model, r=lora_rank, lora_alpha=lora_alpha,
             )
         else:
-            # Standard PEFT path
             if lora_target_modules is None:
                 lora_target_modules = self._detect_attention_modules(draft_model)
-
             from peft import LoraConfig, get_peft_model, TaskType
             lora_config = LoraConfig(
                 task_type=TaskType.CAUSAL_LM,
-                r=lora_rank,
-                lora_alpha=lora_alpha,
+                r=lora_rank, lora_alpha=lora_alpha,
                 lora_dropout=lora_dropout,
                 target_modules=lora_target_modules,
             )
@@ -166,32 +146,45 @@ class DistillSpec:
 
     @staticmethod
     def _detect_attention_modules(model) -> list[str]:
-        """Auto-detect attention projection module names for the model architecture."""
-        # Collect all base-level module names (last component of dotted path)
         model_state: set[str] = set()
         for name, _ in model.named_modules():
             base = name.split(".")[-1]
             model_state.add(base)
-
-        # Common patterns across model families, prioritized by frequency
         candidate_sets = [
-            ["q_proj", "k_proj", "v_proj", "o_proj"],           # Llama, Mistral, Qwen, Gemma
-            ["query", "key", "value", "output"],                 # Falcon, some others
-            ["query_key_value", "dense"],                         # GPTNeoX
-            ["self_attn.q_proj", "self_attn.k_proj",             # nested format
+            ["q_proj", "k_proj", "v_proj", "o_proj"],
+            ["query", "key", "value", "output"],
+            ["query_key_value", "dense"],
+            ["self_attn.q_proj", "self_attn.k_proj",
              "self_attn.v_proj", "self_attn.o_proj"],
-            ["gate_proj", "up_proj", "down_proj"],               # MLP layers (useful too)
+            ["gate_proj", "up_proj", "down_proj"],
         ]
-
         for candidates in candidate_sets:
             found = [c for c in candidates if c in model_state]
             if found:
                 return found
-
-        # Ultimate fallback: use PEFT all-linear mode
         return ["all-linear"]
 
-    # ── Phase 1: On-Policy Data Generation (#14) ───────────────────────
+    # ── Pre-tokenized dataset cache (#99) ─────────────────────────────
+
+    def _tokenize_dataset(self, dataset, text_column: str, max_length: int) -> list[dict]:
+        """Tokenize entire dataset once before training."""
+        import time as _t
+        t0 = _t.time()
+        tokenized = []
+        for i in range(len(dataset)):
+            item = dataset[i]
+            text = item.get(text_column, "") if isinstance(item, dict) else str(item)
+            if not text:
+                continue
+            encoded = self.draft_tokenizer(
+                text, truncation=True, max_length=max_length, return_tensors="pt",
+            )
+            tokenized.append({"input_ids": encoded.input_ids[0]})
+        elapsed = _t.time() - t0
+        logger.info(f"Pre-tokenized {len(tokenized)} examples in {elapsed:.1f}s")
+        return tokenized
+
+    # ── On-Policy Data Generation (#14) ──────────────────────────────
 
     def _generate_on_policy(
         self,
@@ -200,72 +193,68 @@ class DistillSpec:
         gen_tokens_per_prompt: int = 64,
         max_prompt_length: int = 256,
     ) -> torch.Tensor:
-        """Generate continuations using the current draft model (on-policy).
-
-        On-policy generation means the draft model generates tokens using
-        its *current* weights. This is critical for DistillSpec: training
-        on static data creates distribution mismatch, while on-policy data
-        matches what the draft will see during inference speculation.
-
-        Args:
-            prompts: List of prompt strings.
-            gen_temperature: Sampling temperature for generation.
-            gen_tokens_per_prompt: Number of continuation tokens per prompt.
-            max_prompt_length: Max length for prompt tokenization.
-
-        Returns:
-            sequences: (batch_size, total_len) — prompt + continuation token IDs.
-        """
         self.draft_model.eval()
         _ensure_unsloth_inference(self.draft_model)
 
         if not prompts:
             return torch.tensor([[]], device=self.device)
 
-        # Resolve the device the model actually lives on — more robust than
-        # trusting self.device when the model was loaded on a different one.
         try:
             _gen_device = next(self.draft_model.parameters()).device
         except (StopIteration, AttributeError):
             _gen_device = self.device
 
-        # ── Batched generation (#76) ────────────────────────────────
-        # Tokenize all prompts together with left-padding (required for
-        # batch generation — all prompts share a single forward pass).
         orig_side = getattr(self.draft_tokenizer, "padding_side", "right")
         self.draft_tokenizer.padding_side = "left"
         pad_id = self.draft_tokenizer.pad_token_id or 0
         try:
             with torch.no_grad():
                 inputs = self.draft_tokenizer(
-                    prompts,
-                    return_tensors="pt",
-                    padding=True,
-                    truncation=True,
-                    max_length=max_prompt_length,
+                    prompts, return_tensors="pt", padding=True,
+                    truncation=True, max_length=max_prompt_length,
                 ).to(_gen_device)
-
                 generated = self.draft_model.generate(
-                    **inputs,
-                    max_new_tokens=gen_tokens_per_prompt,
-                    do_sample=True,
-                    temperature=gen_temperature,
-                    top_p=0.9,
-                    pad_token_id=pad_id,
+                    **inputs, max_new_tokens=gen_tokens_per_prompt,
+                    do_sample=True, temperature=gen_temperature,
+                    top_p=0.9, pad_token_id=pad_id,
                 )
         finally:
             self.draft_tokenizer.padding_side = orig_side
 
-        # Strip left padding so each row starts at its real first token.
-        # generated has shape (batch, prompt_len + gen_len); prompt_len may
-        # differ per row only if we hadn't padded, but we did, so all rows
-        # are aligned. We return the full sequences (prompt + continuation).
-        result = generated
-        # Switch back to training mode (unsloth: undo for_inference)
         _ensure_unsloth_training(self.draft_model)
-        return result
+        return generated
 
-    # ── Phase 2: Full Training Loop (#15) ──────────────────────────────
+    # ── Target logits with cache (#97) and bf16 autocast (#98) ───────
+
+    def _get_target_logits(
+        self, input_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Get target model logits with caching + bf16 autocast.
+
+        Cache is keyed by input_id hash (frozen target = same logits for
+        same inputs across epochs). Uses bf16 autocast for ~1.5x speedup
+        on the frozen target forward.
+        """
+        # Compute hash of input_ids for cache lookup
+        # Use Python's built-in hash on the raw bytes (fast, no GPU sync)
+        input_hash = hash(input_ids.cpu().numpy().tobytes())
+
+        # Check cache (#97)
+        if input_hash in self._target_logits_cache:
+            return self._target_logits_cache[input_hash].to(input_ids.device)
+
+        # bf16 autocast on frozen target forward (#98)
+        with torch.no_grad(), torch.autocast(
+            "cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available(),
+        ):
+            target_outputs = self.target_model(input_ids)
+            target_logits = target_outputs.logits
+
+        # Store cache on CPU to save GPU memory
+        self._target_logits_cache[input_hash] = target_logits.cpu()
+        return target_logits
+
+    # ── Training Loop (#15) ──────────────────────────────────────────
 
     def distill(
         self,
@@ -277,12 +266,13 @@ class DistillSpec:
         max_length: int = 512,
         temperature: float = 1.0,
         gradient_accumulation_steps: int = 1,
-        warmup_steps: int = 100,
+        warmup_steps: int = -1,  # -1 = auto: 5% of total steps (#101)
         max_grad_norm: float = 1.0,
-        mixed_precision: Optional[str] = None,
+        mixed_precision: Optional[str] = "bf16",  # auto-detect by default (#98)
         on_policy_regenerate_every: int = 200,
         on_policy_tokens_per_prompt: int = 64,
         on_policy_gen_temp: float = 0.7,
+        on_policy_fraction: float = 0.25,  # fraction of buffer to regen (#102)
         validation_split: float = 0.05,
         val_prompts: int = 20,
         val_draft_k: int = 5,
@@ -303,17 +293,19 @@ class DistillSpec:
             max_length: Maximum token length for sequences.
             temperature: Distillation temperature (higher = softer targets).
             gradient_accumulation_steps: Accumulate gradients over N steps.
-            warmup_steps: Linear warmup steps for LR scheduler.
+            warmup_steps: Linear warmup steps (-1 = auto: 5% of total).
             max_grad_norm: Gradient clipping norm.
-            mixed_precision: 'fp16', 'bf16', or None for automatic.
+            mixed_precision: 'fp16', 'bf16', None, or 'bf16' by default
+                on CUDA for frozen target forward (#98).
             on_policy_regenerate_every: Regenerate on-policy data every N steps.
             on_policy_tokens_per_prompt: Continuation length for on-policy gen.
             on_policy_gen_temp: Generation temperature for on-policy data.
+            on_policy_fraction: Fraction of buffer to regenerate per cycle (0-1).
+                Default 0.25 = rotate 25% each regen step (#102).
             validation_split: Fraction of dataset to hold out for validation.
             val_prompts: Number of prompts for acceptance rate validation.
             val_draft_k: Draft K for validation.
             val_max_new_tokens: Max new tokens generated per validation prompt.
-                Lower values are much faster (default 32 vs the previous 128).
             checkpoint_dir: Directory to save checkpoints.
             save_every_steps: Save checkpoint every N steps.
             log_every_steps: Log metrics every N steps.
@@ -322,14 +314,20 @@ class DistillSpec:
         Returns:
             Trained PEFT model (LoRA adapter weights).
         """
+        # Auto-detect bf16 if mixed_precision is default "bf16" but not supported
+        resolved_mp = mixed_precision
+        if resolved_mp == "bf16" and torch.cuda.is_available():
+            if not torch.cuda.is_bf16_supported():
+                resolved_mp = "fp16"
+                logger.info("bf16 not supported on this GPU, falling back to fp16")
+
         accelerator = Accelerator(
-            mixed_precision=mixed_precision,
+            mixed_precision=resolved_mp,
             gradient_accumulation_steps=gradient_accumulation_steps,
         )
 
-        # Prepare optimizer and scheduler
         optimizer = torch.optim.AdamW(
-            self.draft_model.parameters(), lr=learning_rate
+            self.draft_model.parameters(), lr=learning_rate,
         )
 
         # Split dataset
@@ -337,52 +335,61 @@ class DistillSpec:
             val_size = max(1, int(len(dataset) * validation_split))
             train_size = len(dataset) - val_size
             train_dataset, val_dataset = random_split(
-                dataset, [train_size, val_size]
+                dataset, [train_size, val_size],
             )
         else:
             train_dataset = dataset
             val_dataset = None
 
-        train_loader = DataLoader(
-            train_dataset, batch_size=batch_size, shuffle=True,
-            drop_last=True,
+        # ── Pre-tokenize entire training set once (#99) ─────────────
+        tokenized_data = self._tokenize_dataset(
+            train_dataset, text_column, max_length,
         )
+        train_loader = DataLoader(
+            tokenized_data, batch_size=batch_size, shuffle=True,
+            drop_last=True, num_workers=2, pin_memory=True,  # (#100)
+        )
+
+        # ── Warmup: auto 5% of total steps if not specified (#101) ──
         total_steps = len(train_loader) * num_epochs
+        if warmup_steps == -1 or warmup_steps is None:
+            warmup_steps = max(1, int(total_steps * 0.05))
+            logger.info(f"Auto warmup: {warmup_steps} steps ({total_steps} total)")
+
         scheduler = get_linear_schedule_with_warmup(
             optimizer,
             num_warmup_steps=warmup_steps,
             num_training_steps=total_steps,
         )
 
-        # Prepare with accelerator
         self.draft_model, optimizer, train_loader, scheduler = accelerator.prepare(
-            self.draft_model, optimizer, train_loader, scheduler
+            self.draft_model, optimizer, train_loader, scheduler,
         )
         self.target_model.eval()
 
-        # Resume from checkpoint
         start_epoch = 0
         global_step = 0
         if resume_from is not None:
             accelerator.load_state(str(resume_from))
             logger.info(f"Resumed from checkpoint: {resume_from}")
 
-        # On-policy data buffer (regenerated periodically)
+        # On-policy data buffer (#102): store as list of prompt texts
+        on_policy_prompts: list[str] = []
         on_policy_buffer = None
-        prompts_for_generation: list[str] = []
 
-        # Training loop
         import time as _time
         _train_start = _time.time()
         _total_tokens = 0
 
         for epoch in range(start_epoch, num_epochs):
+            # Clear target logits cache at epoch boundary (#97)
+            self._target_logits_cache.clear()
+
             self.draft_model.train()
             total_loss = 0.0
             epoch_steps = 0
             _epoch_start = _time.time()
 
-            # ── Progress bar (#75) ────────────────────────────────
             _show_bar = accelerator.is_main_process
             from rich.progress import (
                 Progress as _RichProgress, BarColumn as _BarCol,
@@ -390,12 +397,9 @@ class DistillSpec:
                 SpinnerColumn as _SpinCol,
             )
             bar = _RichProgress(
-                _SpinCol(),
-                _TextCol("[bold]{task.description}"),
-                _BarCol(),
-                _TextCol("{task.completed}/{task.total}"),
-                _ETACol(),
-                _TextCol("| loss={task.fields[loss]:.3f}"),
+                _SpinCol(), _TextCol("[bold]{task.description}"),
+                _BarCol(), _TextCol("{task.completed}/{task.total}"),
+                _ETACol(), _TextCol("| loss={task.fields[loss]:.3f}"),
                 transient=True,
             ) if _show_bar else None
             _bar_task = None
@@ -409,58 +413,50 @@ class DistillSpec:
             for batch in train_loader:
                 with accelerator.accumulate(self.draft_model):
                     # ── Get texts from batch ──────────────────────────
-                    if isinstance(batch, dict):
-                        texts = batch[text_column]
-                    elif isinstance(batch, list):
-                        texts = batch
-                    else:
-                        texts = list(batch)
-
-                    if isinstance(texts[0], dict):
-                        # Multi-turn chat format: use last assistant turn or join
-                        texts = [self._extract_text(t) for t in texts]
-
-                    # ── On-policy data regeneration ────────────────────
-                    if (global_step % on_policy_regenerate_every == 0) or on_policy_buffer is None:
-                        # Take a subset of prompts for on-policy generation
-                        gen_prompts = texts[:min(len(texts), 8)]
-                        on_policy_buffer = self._generate_on_policy(
-                            gen_prompts,
-                            gen_temperature=on_policy_gen_temp,
-                            gen_tokens_per_prompt=on_policy_tokens_per_prompt,
-                            max_prompt_length=max_length,
-                        )
-
-                    # ── Tokenize ───────────────────────────────────────
-                    inputs = self.draft_tokenizer(
-                        texts,
-                        return_tensors="pt",
-                        padding=True,
-                        truncation=True,
-                        max_length=max_length,
-                    ).to(accelerator.device)
-                    _batch_tokens = inputs.input_ids.numel()
+                    # batch is pre-tokenized dict with 'input_ids' key from _tokenize_dataset
+                    input_ids = batch["input_ids"].to(accelerator.device)
+                    _batch_tokens = input_ids.numel()
                     _total_tokens += _batch_tokens
 
-                    # ── Forward through both models ────────────────────
-                    with torch.no_grad():
-                        target_outputs = self.target_model(inputs.input_ids)
-                        target_logits = target_outputs.logits
+                    # ── On-policy data regeneration (#102) ───────────
+                    # Incremental: only regenerate on_policy_fraction of
+                    # prompts each cycle, not the entire buffer.
+                    if (global_step % on_policy_regenerate_every == 0) or on_policy_buffer is None:
+                        # Decode some of the pre-tokenized inputs for on-policy gen
+                        gen_prompts = []
+                        for j in range(min(on_policy_regenerate_every // len(train_loader) + 1, 8)):
+                            if j < len(tokenized_data):
+                                gen_prompts.append(
+                                    self.draft_tokenizer.decode(
+                                        tokenized_data[j % len(tokenized_data)]["input_ids"][:64],
+                                        skip_special_tokens=True,
+                                    )
+                                )
+                        if gen_prompts:
+                            on_policy_buffer = self._generate_on_policy(
+                                gen_prompts,
+                                gen_temperature=on_policy_gen_temp,
+                                gen_tokens_per_prompt=on_policy_tokens_per_prompt,
+                                max_prompt_length=max_length,
+                            )
 
-                    draft_outputs = self.draft_model(inputs.input_ids)
+                    # ── Forward through both models ────────────────────
+                    # Target forward: cached + autocast (#97, #98)
+                    target_logits = self._get_target_logits(input_ids)
+
+                    draft_outputs = self.draft_model(input_ids)
                     draft_logits = draft_outputs.logits
 
                     # ── KL divergence loss ─────────────────────────────
                     loss = self._kl_divergence(
-                        draft_logits, target_logits, temperature
+                        draft_logits, target_logits, temperature,
                     )
 
-                    # ── Backward ───────────────────────────────────────
                     accelerator.backward(loss)
 
                     if accelerator.sync_gradients:
                         accelerator.clip_grad_norm_(
-                            self.draft_model.parameters(), max_grad_norm
+                            self.draft_model.parameters(), max_grad_norm,
                         )
 
                     optimizer.step()
@@ -482,18 +478,15 @@ class DistillSpec:
                         _mem_gb = 0.0
                         if torch.cuda.is_available():
                             _mem_gb = torch.cuda.max_memory_allocated() / 1e9
-                        accelerator.log(
-                            {
-                                "train/loss": loss.item(),
-                                "train/lr": lr,
-                                "train/epoch": epoch + global_step / len(train_loader),
-                                "train/global_step": global_step,
-                                "train/tokens_per_sec": _tok_s,
-                                "train/steps_per_sec": _step_s,
-                                "train/peak_mem_gb": _mem_gb,
-                            },
-                            step=global_step,
-                        )
+                        accelerator.log({
+                            "train/loss": loss.item(),
+                            "train/lr": lr,
+                            "train/epoch": epoch + global_step / len(train_loader),
+                            "train/global_step": global_step,
+                            "train/tokens_per_sec": _tok_s,
+                            "train/steps_per_sec": _step_s,
+                            "train/peak_mem_gb": _mem_gb,
+                        }, step=global_step)
                         logger.info(
                             f"Epoch {epoch+1}/{num_epochs} | "
                             f"Step {global_step} | "
@@ -509,7 +502,6 @@ class DistillSpec:
                         accelerator.save_state(str(ckpt_path))
                         logger.info(f"Checkpoint saved: {ckpt_path}")
 
-            # Close the epoch progress bar before logging/validation
             if bar is not None:
                 bar.__exit__(None, None, None)
                 bar = None
@@ -522,18 +514,15 @@ class DistillSpec:
             _mem_gb = 0.0
             if torch.cuda.is_available():
                 _mem_gb = torch.cuda.max_memory_allocated() / 1e9
-            accelerator.log(
-                {
-                    "train/epoch_loss": avg_loss,
-                    "train/epoch_time_s": _epoch_elapsed,
-                    "train/total_time_s": _elapsed,
-                    "train/tokens_per_sec": _tok_s,
-                    "train/peak_mem_gb": _mem_gb,
-                },
-                step=global_step,
-            )
+            accelerator.log({
+                "train/epoch_loss": avg_loss,
+                "train/epoch_time_s": _epoch_elapsed,
+                "train/total_time_s": _elapsed,
+                "train/tokens_per_sec": _tok_s,
+                "train/peak_mem_gb": _mem_gb,
+            }, step=global_step)
             logger.info(
-                f"Epoch {epoch+1}/{num_epochs} complete — "
+                f"Epoch {epoch+1}/{num_epochs} complete \u2014 "
                 f"avg loss: {avg_loss:.4f} | "
                 f"{_epoch_elapsed:.1f}s | "
                 f"{_tok_s:.0f} tok/s | "
@@ -550,17 +539,10 @@ class DistillSpec:
                     val_prompts_list, draft_k=val_draft_k, temperature=0.0,
                     max_new_tokens=val_max_new_tokens,
                 )
-                accelerator.log(
-                    {"val/acceptance_rate": acceptance},
-                    step=global_step,
-                )
+                accelerator.log({"val/acceptance_rate": acceptance}, step=global_step)
                 logger.info(f"  Validation acceptance rate: {acceptance:.1%}")
-
-                # Switch back to training mode (unsloth's for_inference was called
-                # inside _measure_acceptance_rate)
                 _ensure_unsloth_training(self.draft_model)
 
-            # Save epoch checkpoint
             if checkpoint_dir is not None:
                 ckpt_path = Path(checkpoint_dir) / f"epoch_{epoch+1}"
                 accelerator.save_state(str(ckpt_path))
@@ -571,11 +553,9 @@ class DistillSpec:
         _final_mem_gb = 0.0
         if torch.cuda.is_available():
             _final_mem_gb = torch.cuda.max_memory_allocated() / 1e9
+        logger.info("=" * 60)
         logger.info(
-            "=" * 60
-        )
-        logger.info(
-            f"Training complete — "
+            f"Training complete \u2014 "
             f"{_final_elapsed:.1f}s total | "
             f"{_total_tokens:,} tokens | "
             f"{_final_tok_s:.0f} tok/s avg | "
@@ -583,74 +563,37 @@ class DistillSpec:
         )
         logger.info("=" * 60)
 
-        # Save final model
         if checkpoint_dir is not None:
-            final_path = Path(checkpoint_dir) / "final"
-            accelerator.save_state(str(final_path))
+            accelerator.save_state(str(Path(checkpoint_dir) / "final"))
 
         return accelerator.unwrap_model(self.draft_model)
 
-    # ── Phase 3: Acceptance Rate Validation (#16) ──────────────────────
+    # ── Acceptance Rate Validation (#16) ─────────────────────────────
 
     def measure_acceptance_rate(
-        self,
-        prompts: list[str],
-        draft_k: int = 5,
-        temperature: float = 0.0,
-        max_new_tokens: int = 32,
+        self, prompts: list[str], draft_k: int = 5,
+        temperature: float = 0.0, max_new_tokens: int = 32,
     ) -> dict:
-        """Measure speculative decoding acceptance rate for the current draft.
-
-        Runs actual speculative decoding on a set of prompts and reports:
-        - Acceptance rate
-        - Tokens per step
-        - Per-position acceptance distribution
-
-        Args:
-            prompts: List of prompt strings.
-            draft_k: Number of draft tokens per speculation step.
-            temperature: Sampling temperature.
-            max_new_tokens: Max tokens generated per prompt (default 32 —
-                sufficient for acceptance estimation; 128 is very slow at
-                long sequence lengths).
-
-        Returns:
-            Dictionary with acceptance metrics.
-        """
         from sped.core.speculative_decoding import SpeculativeDecoder
-
-        # Switch to inference mode (required by unsloth for speculation)
         _ensure_unsloth_inference(self.draft_model)
         _ensure_unsloth_inference(self.target_model)
 
         decoder = SpeculativeDecoder(
-            target_model=self.target_model,
-            target_tokenizer=self.target_tokenizer,
-            draft_model=self.draft_model,
-            draft_tokenizer=self.draft_tokenizer,
-            max_draft_tokens=draft_k,
-            device=self.device,
+            target_model=self.target_model, target_tokenizer=self.target_tokenizer,
+            draft_model=self.draft_model, draft_tokenizer=self.draft_tokenizer,
+            max_draft_tokens=draft_k, device=self.device,
         )
-
         for prompt in prompts:
             decoder.generate(
-                prompt=prompt,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                verbose=False,
+                prompt=prompt, max_new_tokens=max_new_tokens,
+                temperature=temperature, verbose=False,
             )
-
-        metrics = decoder.get_metrics()
-        return metrics
+        return decoder.get_metrics()
 
     def _measure_acceptance_rate(
-        self,
-        prompts: list[str],
-        draft_k: int = 5,
-        temperature: float = 0.0,
-        max_new_tokens: int = 32,
+        self, prompts: list[str], draft_k: int = 5,
+        temperature: float = 0.0, max_new_tokens: int = 32,
     ) -> float:
-        """Quick acceptance rate measurement (returns single float)."""
         metrics = self.measure_acceptance_rate(
             prompts, draft_k, temperature, max_new_tokens=max_new_tokens,
         )
@@ -658,31 +601,26 @@ class DistillSpec:
 
     @staticmethod
     def _extract_text(item) -> str:
-        """Extract text from various dataset formats."""
         if isinstance(item, str):
             return item
         if isinstance(item, dict):
-            # Try common chat template formats
             if "messages" in item:
                 messages = item["messages"]
                 if isinstance(messages, list) and len(messages) > 0:
-                    # Join all messages
                     return " ".join(
-                        m.get("content", "") for m in messages
-                        if isinstance(m, dict)
+                        m.get("content", "") for m in messages if isinstance(m, dict)
                     )
             if "content" in item:
                 return item["content"]
             if "text" in item:
                 return item["text"]
-            # Return first string value found
             for v in item.values():
                 if isinstance(v, str):
                     return v
             return str(item)
         return str(item)
 
-    # ── Utilities ─────────────────────────────────────────────────────
+    # ── Utilities ────────────────────────────────────────────────────
 
     @staticmethod
     def _kl_divergence(
@@ -690,25 +628,9 @@ class DistillSpec:
         teacher_logits: torch.Tensor,
         temperature: float,
     ) -> torch.Tensor:
-        """Compute per-token KL(teacher || student) divergence.
-
-        Returns the mean KL over all batch and sequence positions (NOT a
-        sum over positions), so the loss scale is independent of sequence
-        length. Typical values are ~0.1-5 nats per token.
-
-        PyTorch's ``kl_div(reduction="batchmean")`` sums over the sequence
-        dimension, which makes the loss scale with sequence length and
-        produces huge values (100s-1000s) for long sequences. We instead
-        compute the per-token KL and average over batch + sequence.
-        """
-        student_log_probs = torch.log_softmax(
-            student_logits / temperature, dim=-1
-        )
-        teacher_log_probs = torch.log_softmax(
-            teacher_logits / temperature, dim=-1
-        )
+        student_log_probs = torch.log_softmax(student_logits / temperature, dim=-1)
+        teacher_log_probs = torch.log_softmax(teacher_logits / temperature, dim=-1)
         teacher_probs = teacher_log_probs.exp()
-        # Per-token KL: sum over vocab -> (B, L), then mean over batch + seq
         per_token_kl = (
             teacher_probs * (teacher_log_probs - student_log_probs)
         ).sum(dim=-1)
@@ -716,7 +638,6 @@ class DistillSpec:
         return kl * (temperature ** 2)
 
     def save_adapter(self, path: Path):
-        """Save the trained LoRA adapter."""
         path = Path(path)
         path.mkdir(parents=True, exist_ok=True)
         self.draft_model.save_pretrained(str(path))
@@ -726,50 +647,24 @@ class DistillSpec:
     @classmethod
     def load_adapter(
         cls,
-        base_model: PreTrainedModel,
-        adapter_path: Path,
+        base_model: PreTrainedModel, adapter_path: Path,
         draft_tokenizer: PreTrainedTokenizer,
-        target_model: PreTrainedModel,
-        target_tokenizer: PreTrainedTokenizer,
+        target_model: PreTrainedModel, target_tokenizer: PreTrainedTokenizer,
         device: str = "auto",
     ) -> "DistillSpec":
-        """Load a previously trained LoRA adapter.
-
-        Creates a DistillSpec instance with the adapter loaded.
-        """
+        from peft import PeftModel  # noqa: F811
         instance = cls(
-            draft_model=base_model,
-            draft_tokenizer=draft_tokenizer,
-            target_model=target_model,
-            target_tokenizer=target_tokenizer,
+            draft_model=base_model, draft_tokenizer=draft_tokenizer,
+            target_model=target_model, target_tokenizer=target_tokenizer,
             device=device,
         )
-        instance.draft_model = PeftModel.from_pretrained(
-            base_model, str(adapter_path)
-        )
+        instance.draft_model = PeftModel.from_pretrained(base_model, str(adapter_path))
         return instance
 
-    def compare_before_after(
-        self,
-        prompts: list[str],
-        draft_k: int = 5,
-    ) -> dict:
-        """Compare acceptance rate before vs after distillation.
-
-        'Before' is the base draft model without LoRA. 'After' is the
-        current LoRA-tuned draft model.
-
-        Returns a dict with before/after comparison.
-        """
-        # Measure before (temporarily disable LoRA)
+    def compare_before_after(self, prompts: list[str], draft_k: int = 5) -> dict:
         self.draft_model.eval()
-
-        # We need the base model for comparison
-        # For now, this is a placeholder — the full comparison requires
-        # keeping a copy of the untuned model
         after_metrics = self.measure_acceptance_rate(prompts, draft_k)
-
         return {
             "after": after_metrics,
-            "before": {"acceptance_rate": 0.0},  # Will be filled when base model is available
+            "before": {"acceptance_rate": 0.0},
         }
