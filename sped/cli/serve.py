@@ -265,6 +265,13 @@ def _resolve_backend(backend: str, has_draft: bool = False) -> str:
         return backend
     if has_draft:
         return "hf"
+    # Auto-detect: try most optimized first
+    try:
+        from sped.serving.unsloth_backend import UnslothBackend
+        if UnslothBackend.is_available():
+            return "unsloth"
+    except ImportError:
+        pass
     try:
         from sped.serving.mlx_backend import MLXBackend
         if MLXBackend.is_available():
@@ -275,7 +282,15 @@ def _resolve_backend(backend: str, has_draft: bool = False) -> str:
 
 
 def _create_backend(backend: str):
-    if backend == "mlx":
+    if backend == "unsloth":
+        try:
+            from sped.serving.unsloth_backend import UnslothBackend
+            return UnslothBackend()
+        except ImportError:
+            logger = get_logger()
+            logger.warning("Unsloth not installed. Falling back to HF.")
+            return HFBackend()
+    elif backend == "mlx":
         try:
             from sped.serving.mlx_backend import MLXBackend
             return MLXBackend()
