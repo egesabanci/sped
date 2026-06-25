@@ -14,12 +14,62 @@ from torch.utils.data import DataLoader, random_split
 from transformers import (
     PreTrainedModel, PreTrainedTokenizer, get_linear_schedule_with_warmup,
 )
-from peft import LoraConfig, get_peft_model, TaskType, PeftModel
 from datasets import Dataset
 from accelerate import Accelerator
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+# ── Unsloth integration helpers ──────────────────────────────────────────
+
+def _is_unsloth_available() -> bool:
+    """Check if unsloth is installed."""
+    try:
+        import unsloth  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _apply_unsloth_lora(model, r: int = 8, lora_alpha: int = 16, **kwargs):
+    """Apply LoRA via FastLanguageModel.get_peft_model with fast kernels."""
+    from unsloth import FastLanguageModel
+    model = FastLanguageModel.get_peft_model(
+        model,
+        r=r,
+        lora_alpha=lora_alpha,
+        lora_dropout=0.0,
+        target_modules=[
+            "q_proj", "k_proj", "v_proj", "o_proj",
+            "gate_proj", "up_proj", "down_proj",
+        ],
+        use_gradient_checkpointing="unsloth",
+        **kwargs,
+    )
+    # Switch to training mode (undoes for_inference if called)
+    FastLanguageModel.for_training(model)
+    return model
+
+
+def _ensure_unsloth_inference(model):
+    """Switch model to inference mode (no-op if unsloth not available)."""
+    if _is_unsloth_available():
+        from unsloth import FastLanguageModel
+        try:
+            FastLanguageModel.for_inference(model)
+        except TypeError:
+            pass  # not an unsloth model, ignore
+
+
+def _ensure_unsloth_training(model):
+    """Switch model to training mode (no-op if unsloth not available)."""
+    if _is_unsloth_available():
+        from unsloth import FastLanguageModel
+        try:
+            FastLanguageModel.for_training(model)
+        except TypeError:
+            pass  # not an unsloth model, ignore
 
 
 class DistillSpec:
@@ -47,6 +97,7 @@ class DistillSpec:
         lora_dropout: float = 0.05,
         lora_target_modules: Optional[list[str]] = None,
         device: str = "auto",
+        backend: str = "auto",
     ):
         if device == "auto":
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -57,20 +108,37 @@ class DistillSpec:
         self.draft_tokenizer = draft_tokenizer
         self.target_model = target_model
         self.target_tokenizer = target_tokenizer
+        self.backend = backend
 
-        # Apply LoRA to the draft model
-        if lora_target_modules is None:
-            # Auto-detect common attention module names
-            lora_target_modules = self._detect_attention_modules(draft_model)
-
-        lora_config = LoraConfig(
-            task_type=TaskType.CAUSAL_LM,
-            r=lora_rank,
-            lora_alpha=lora_alpha,
-            lora_dropout=lora_dropout,
-            target_modules=lora_target_modules,
+        # Resolve backend: prefer unsloth if auto and available
+        use_unsloth = (
+            backend == "unsloth" or (
+                backend == "auto" and _is_unsloth_available()
+            )
         )
-        self.draft_model = get_peft_model(draft_model, lora_config)
+
+        if use_unsloth:
+            logger.info("Applying LoRA via Unsloth fast kernels")
+            self.draft_model = _apply_unsloth_lora(
+                draft_model,
+                r=lora_rank,
+                lora_alpha=lora_alpha,
+            )
+        else:
+            # Standard PEFT path
+            if lora_target_modules is None:
+                lora_target_modules = self._detect_attention_modules(draft_model)
+
+            from peft import LoraConfig, get_peft_model, TaskType
+            lora_config = LoraConfig(
+                task_type=TaskType.CAUSAL_LM,
+                r=lora_rank,
+                lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
+                target_modules=lora_target_modules,
+            )
+            self.draft_model = get_peft_model(draft_model, lora_config)
+
         trainable = sum(p.numel() for p in self.draft_model.parameters() if p.requires_grad)
         total = sum(p.numel() for p in self.draft_model.parameters())
         logger.info(
@@ -380,6 +448,10 @@ class DistillSpec:
                 )
                 logger.info(f"  Validation acceptance rate: {acceptance:.1%}")
 
+                # Switch back to training mode (unsloth's for_inference was called
+                # inside _measure_acceptance_rate)
+                _ensure_unsloth_training(self.draft_model)
+
             # Save epoch checkpoint
             if checkpoint_dir is not None:
                 ckpt_path = Path(checkpoint_dir) / f"epoch_{epoch+1}"
@@ -416,6 +488,10 @@ class DistillSpec:
             Dictionary with acceptance metrics.
         """
         from sped.core.speculative_decoding import SpeculativeDecoder
+
+        # Switch to inference mode (required by unsloth for speculation)
+        _ensure_unsloth_inference(self.draft_model)
+        _ensure_unsloth_inference(self.target_model)
 
         decoder = SpeculativeDecoder(
             target_model=self.target_model,

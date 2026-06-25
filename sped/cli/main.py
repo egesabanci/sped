@@ -75,7 +75,12 @@ def info(
 
     if torch.cuda.is_available():
         info_data["gpu"] = torch.cuda.get_device_name(0)
-        info_data["vram_gb"] = round(torch.cuda.get_device_properties(0).total_mem / 1e9, 1)
+        try:
+            props = torch.cuda.get_device_properties(0)
+            vram = getattr(props, "total_memory", getattr(props, "total_mem", 0))
+            info_data["vram_gb"] = round(vram / 1e9, 1)
+        except Exception:
+            info_data["vram_gb"] = 0.0
 
     if output == "json":
         import json as _json
