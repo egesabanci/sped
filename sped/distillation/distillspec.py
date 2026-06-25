@@ -271,40 +271,34 @@ class DistillSpec:
         Caches the intermediate hidden states (38× smaller than full logits)
         so that repeated inputs across epochs skip the expensive 8B model
         forward and only compute the cheap lm_head (a single linear layer).
-        Cache is bounded to ``_target_cache_max`` entries (~1.7 GB at max
-        seq_len=4096) with FIFO eviction.
+        Cache is bounded to ``_target_cache_max`` entries with FIFO eviction.
         """
+        # Build cache key once — used for both lookup and write
+        _key_cache = hash((
+            input_ids.cpu().numpy().tobytes(),
+            attention_mask.cpu().numpy().tobytes() if attention_mask is not None else b"",
+        ))
+
         # ── Cache hit? ──────────────────────────────────────────────
-        if self._target_hidden_cache is not None and len(self._target_hidden_cache) > 0:
-            # Build cache key: hash of (input_ids_bytes, attention_mask_bytes)
-            key = hash((
-                input_ids.cpu().numpy().tobytes(),
-                attention_mask.cpu().numpy().tobytes() if attention_mask is not None else b"",
-            ))
-            if key in self._target_hidden_cache:
-                _, hidden_cpu = self._target_hidden_cache[key]
-                with torch.inference_mode(), torch.autocast(
-                    "cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available(),
-                ):
-                    # Load cached hidden states to GPU and apply lm_head
-                    hidden = hidden_cpu.to(device=input_ids.device, dtype=torch.bfloat16)
-                    logits = self.target_model.lm_head(hidden)
-                return logits
+        if _key_cache in self._target_hidden_cache:
+            _, hidden_cpu = self._target_hidden_cache[_key_cache]
+            with torch.inference_mode(), torch.autocast(
+                "cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available(),
+            ):
+                hidden = hidden_cpu.to(device=input_ids.device, dtype=torch.bfloat16)
+                logits = self.target_model.lm_head(hidden)
+            return logits
 
         # ── Cache miss: compute forward ─────────────────────────────
         with torch.inference_mode(), torch.autocast(
             "cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available(),
         ):
-            # Use model + lm_head split so we can cache the (small) hidden states.
-            # The xformers causal mask is required to match the Unsloth fast forward;
-            # without it, model + lm_head produces different logits than the full forward.
             try:
                 from xformers.ops import LowerTriangularMask
                 causal_mask = LowerTriangularMask()
             except ImportError:
                 causal_mask = None
 
-            # Run the base model to get hidden states
             if hasattr(self.target_model, "model") and causal_mask is not None:
                 base_out = self.target_model.model(
                     input_ids,
@@ -315,22 +309,16 @@ class DistillSpec:
                 )
                 hidden = base_out.last_hidden_state
                 # Cache hidden states on CPU (38× smaller than logits)
-                if self._target_hidden_cache is not None:
-                    key = hash((
-                        input_ids.cpu().numpy().tobytes(),
-                        attention_mask.cpu().numpy().tobytes() if attention_mask is not None else b"",
-                    ))
-                    hidden_cpu = hidden.cpu().to(torch.bfloat16)
-                    self._target_hidden_cache[key] = (key, hidden_cpu)
-                    # Evict oldest if over cap
-                    if len(self._target_hidden_cache) > self._target_cache_max:
-                        # FIFO eviction: remove first inserted entry
-                        oldest_key = next(iter(self._target_hidden_cache))
-                        del self._target_hidden_cache[oldest_key]
-                # Apply lm_head to get logits
+                hidden_cpu = hidden.cpu().to(torch.bfloat16)
+                self._target_hidden_cache[_key_cache] = (_key_cache, hidden_cpu)
+                # FIFO eviction if over cap
+                if len(self._target_hidden_cache) > self._target_cache_max:
+                    oldest_key = next(iter(self._target_hidden_cache))
+                    del self._target_hidden_cache[oldest_key]
+                # Apply lm_head
                 logits = self.target_model.lm_head(hidden.to(torch.bfloat16))
             else:
-                # Fallback: full model forward (no caching)
+                # Fallback: full model forward (no xformers — no caching possible)
                 target_outputs = self.target_model(input_ids, attention_mask=attention_mask)
                 logits = target_outputs.logits
 

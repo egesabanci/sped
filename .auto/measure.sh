@@ -1,12 +1,9 @@
 #!/bin/bash
 set -euo pipefail
-# Autoresearch measure script for sped training throughput
-# Tests hidden-state cache performance: warmup epoch (cache write) +
-# timed epoch (cache read, only lm_head compute)
-
 source /data/unsloth_env/bin/activate
 cd /data/sped
 
+# Measure cache-hit throughput (epoch 2+ behavior at batch_size=1)
 python3 << 'PYEOF'
 import sys, os, time, torch, gc
 sys.path.insert(0, '/data/sped')
@@ -32,13 +29,9 @@ target, _ = FastLanguageModel.from_pretrained(
     '/data/models/Qwen3-8B-4bit-cache', max_seq_length=4096,
     load_in_4bit=True, device_map='cuda',
 )
-
 ds = load_from_disk('/data/ultrachat_200k_eval10')
 
-spec = DistillSpec(
-    draft, tok, target, tok,
-    lora_rank=32, lora_alpha=32, device='cuda', backend='unsloth',
-)
+spec = DistillSpec(draft, tok, target, tok, lora_rank=32, lora_alpha=32, device='cuda', backend='unsloth')
 
 # Pre-tokenize
 tokenized = []
@@ -47,27 +40,19 @@ for i in range(len(ds)):
     encoded = tok(text, truncation=True, max_length=4096, return_tensors='pt')
     tokenized.append({'input_ids': encoded.input_ids[0]})
 
-# ── Warmup epoch: populate hidden-state cache (no timing) ──────────
-import logging as _lg
-_lg.warning("=== Warming up target hidden-state cache ===")
+# Warmup: populate hidden-state cache (simulating epoch 1 cache writes)
 for batch_data in tokenized:
     batch = DistillSpec._collate_batch([batch_data])
-    input_ids = batch['input_ids'].cuda()
-    attn_mask = batch['attention_mask'].cuda()
-    _ = spec._get_target_logits(input_ids, attn_mask)
+    _ = spec._get_target_logits(batch['input_ids'].cuda(), batch['attention_mask'].cuda())
+print(f"Cache: {len(spec._target_hidden_cache)} entries")
 
-cache_size = len(spec._target_hidden_cache)
-_lg.warning(f"Cache populated: {cache_size} entries")
-print(f"\nCache entries: {cache_size}")
-
-# ── Timed epoch: cache hits → only lm_head compute ────────────────
+# Timed epoch: all cache hits (simulating epoch 2+)
+opt = torch.optim.AdamW(spec.draft_model.parameters(), lr=5e-5)
 t_start = time.time()
 total_tokens = 0
 total_steps = 0
 
-opt = torch.optim.AdamW(spec.draft_model.parameters(), lr=5e-5)
-
-for step, batch_data in enumerate(tokenized):
+for batch_data in tokenized:
     batch = DistillSpec._collate_batch([batch_data])
     input_ids = batch['input_ids'].cuda()
     attn_mask = batch['attention_mask'].cuda()
@@ -75,9 +60,8 @@ for step, batch_data in enumerate(tokenized):
     total_tokens += n_tokens
     total_steps += 1
 
-    # This now hits the cache (loads hidden→GPU→lm_head)
+    # Cache hit: loads hidden from CPU→GPU, computes lm_head only
     tl = spec._get_target_logits(input_ids, attn_mask)
-
     do = spec.draft_model(input_ids, attention_mask=attn_mask).logits
     loss = DistillSpec._kl_divergence(do, tl, 1.0, attn_mask)
     loss.backward()
@@ -86,21 +70,18 @@ for step, batch_data in enumerate(tokenized):
 
 t_end = time.time()
 elapsed = t_end - t_start
-vram_peak = torch.cuda.max_memory_allocated() / 1e9
-vram_cur = torch.cuda.memory_allocated() / 1e9
-tokens_per_sec = total_tokens / elapsed
-step_time_ms = elapsed / total_steps * 1000
+vram = torch.cuda.max_memory_allocated() / 1e9
+tok_s = total_tokens / elapsed
+step_ms = elapsed / total_steps * 1000
+mean_len = total_tokens / total_steps
 
-print(f"\n=== RESULTS (CACHED — epoch 2+ behavior) ===")
-print(f"Steps: {total_steps}, Tokens: {total_tokens}")
-print(f"Time: {elapsed:.1f}s")
-print(f"Tokens/sec: {tokens_per_sec:.0f}")
-print(f"Step time: {step_time_ms:.0f}ms")
-print(f"VRAM peak: {vram_peak:.1f}GB, cur: {vram_cur:.1f}GB")
+print(f"\n=== RESULTS (CACHE HIT — epoch 2+, bs=1) ===")
+print(f"Steps: {total_steps}, Tokens: {total_tokens}, Time: {elapsed:.1f}s")
+print(f"Tokens/sec: {tok_s:.0f}, Step time: {step_ms:.0f}ms, VRAM: {vram:.1f}GB")
 print(f"NOTE: target forward skipped via hidden-state cache hit")
 
-print(f"METRIC tokens_per_sec={tokens_per_sec:.0f}")
-print(f"METRIC step_time_ms={step_time_ms:.0f}")
-print(f"METRIC vram_gb={vram_peak:.1f}")
-print(f"METRIC mean_seq_len={total_tokens/total_steps:.0f}")
+print(f"METRIC tokens_per_sec={tok_s:.0f}")
+print(f"METRIC step_time_ms={step_ms:.0f}")
+print(f"METRIC vram_gb={vram:.1f}")
+print(f"METRIC mean_seq_len={mean_len:.0f}")
 PYEOF
