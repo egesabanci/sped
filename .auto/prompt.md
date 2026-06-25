@@ -34,20 +34,46 @@ Outputs `METRIC metrics=...` JSON line with primary + secondary metrics.
 
 ## What's Been Tried
 
-### Baseline (commit 6085867)
-- Profile at L=1024: 744ms/step, 1377 tok/s, 10.1 GB VRAM
-- Profile at L=2048: 1344ms/step, 1524 tok/s, 12.3 GB VRAM
-- Profile at L=4096: 2735ms/step, 1498 tok/s, 16.7 GB VRAM
-- Tok/s is FLAT at ~1500 regardless of seq_len — scales linearly with seq_len
-- Target forward = 48% of step time (dominant)
-- Draft forward = 18% (smaller)
-- Backward+optimizer = 34%
-- VRAM headroom at L=4096: 5.3 GB
+### ✅ Experiment 1: torch.inference_mode() for target forward (+19%)
+`torch.no_grad()` → `torch.inference_mode()` in `_get_target_logits`. Disables more
+autograd tracking internals. Safe for frozen models. Baseline: 1128→1339 tok/s.
+Committed at `6ce41a0`.
 
-### Potential directions (not yet tried):
-1. Disable Unsloth gradient checkpointing to avoid recomputation in backward — VRAM headroom exists
-2. Use `torch.inference_mode()` on target forward (slightly faster than `no_grad`)
-3. Investigate on-policy buffer — it generates completions but training uses batch data, not generated data (dead code?)
-4. `torch.compile` the draft model for fused LoRA kernels
-5. Profile native attention ops to find micro-optimizations
-6. Reduce Python overhead in training loop (logging, progress bars)
+### ❌ Experiment 2: Disable gradient checkpointing (crash)
+Setting `use_gradient_checkpointing=False` in Unsloth's get_peft_model crashes —
+the patched LlamaModel_fast_forward expects `_gradient_checkpointing_func`.
+Unsloth requires checkpointing. Reverted.
+
+### ❌ Experiment 3: torch.compile on draft model (+3% — not worth it)
+`torch.compile(draft, mode='reduce-overhead')` gave only 41ms saving out of
+1341ms step time. The backward pass recomputation is the bottleneck, not the
+forward. Plus dynamic shapes cause recompilation. Reverted.
+
+### ❌ Experiment 4: torch.compile on target model (2× SLOWER)
+Unsloth's patched 4-bit model with custom CUDA kernels is incompatible with
+torch.compile. 677ms → 1414ms. Reverted.
+
+### ❌ Experiment 5: bf16 autocast for draft forward (neutral)
+Adding autocast to the draft forward didn't help — Unsloth already handles
+precision internally. 217ms → 229ms. Not worth it.
+
+### ❌ Experiment 6: fused AdamW for LoRA (-13% regression)
+`fused=True` in AdamW regressed throughput (1339→1169 tok/s). The 392 small
+LoRA tensors (32K params each) have too much kernel launch overhead per tensor
+for the fused kernel to benefit. Reverted.
+
+### 💡 Experiment 7: Target logits caching cross-epoch (+87% simulated)
+Pre-computed target logits on CPU RAM and skipped target forward during
+training. Shows 2489 tok/s (87% improvement) but ONLY practical for small
+datasets (eval10 fits 4.5 GB cache, smoke 100-example doesn't at 45 GB).
+Not merged.
+
+### Key architectural insight
+**Target forward = 48% of step time.** It's bandwidth-bound (8B model weights
+read from HBM per token). The only way to get a large improvement is to
+reduce (or eliminate) the target forward cost. Caching works for small
+datasets but doesn't scale to 5k+ examples.
+
+The +19% from inference_mode() is the best practical gain. Further gains
+require structural changes: hidden-state caching, model parallelism,
+reduced precision for the target, or processing fewer tokens per step.
