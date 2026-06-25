@@ -298,7 +298,9 @@ class DistillSpec:
             padded = torch.stack([
                 torch.nn.functional.pad(h, (0, 0, 0, max_ex_len - h.shape[1]))
                 for h in hidden_parts
-            ])
+            ])  # previously: squeeze(1) needed because each h is (1, L, H)
+            if padded.dim() == 4:  # (B, 1, L, H) — squeeze dim 1
+                padded = padded.squeeze(1)
             with torch.inference_mode(), torch.autocast(
                 "cuda", dtype=dtype, enabled=torch.cuda.is_available(),
             ):
