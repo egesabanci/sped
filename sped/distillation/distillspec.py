@@ -469,6 +469,7 @@ class DistillSpec:
                     # ── KL divergence loss ─────────────────────────────
                     loss = self._kl_divergence(
                         draft_logits, target_logits, temperature,
+                        attention_mask=attention_mask,
                     )
 
                     accelerator.backward(loss)
@@ -646,14 +647,20 @@ class DistillSpec:
         student_logits: torch.Tensor,
         teacher_logits: torch.Tensor,
         temperature: float,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         student_log_probs = torch.log_softmax(student_logits / temperature, dim=-1)
         teacher_log_probs = torch.log_softmax(teacher_logits / temperature, dim=-1)
         teacher_probs = teacher_log_probs.exp()
         per_token_kl = (
             teacher_probs * (teacher_log_probs - student_log_probs)
-        ).sum(dim=-1)
-        kl = per_token_kl.mean()
+        ).sum(dim=-1)  # (B, L)
+        # Mask out padding positions if attention_mask is provided
+        if attention_mask is not None:
+            per_token_kl = per_token_kl * attention_mask.float()
+            kl = per_token_kl.sum() / attention_mask.float().sum().clamp(min=1)
+        else:
+            kl = per_token_kl.mean()
         return kl * (temperature ** 2)
 
     def save_adapter(self, path: Path):
