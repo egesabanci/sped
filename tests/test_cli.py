@@ -344,6 +344,23 @@ def test_validation_timeout_invalid():
         validate_timeout(7200)
 
 
+def test_validation_dtype_valid():
+    from sped.utils.validation import validate_dtype
+    assert validate_dtype("auto") == "auto"
+    assert validate_dtype("float16") == "float16"
+    assert validate_dtype("bfloat16") == "bfloat16"
+    assert validate_dtype("float32") == "float32"
+
+
+def test_validation_dtype_invalid():
+    from sped.utils.validation import validate_dtype
+    import pytest as _pytest
+    with _pytest.raises(ValueError):
+        validate_dtype("int8")
+    with _pytest.raises(ValueError):
+        validate_dtype("float64")
+
+
 # ── logging tests ────────────────────────────────────────
 
 

@@ -224,22 +224,33 @@ class HFBackend(InferenceBackend):
         - 'awq': AWQ (auto-detected from model config)
         - 'gptq': GPTQ (auto-detected from model config)
         - None: no quantization
+
+        Raises a clear error if bitsandbytes is required but not installed.
         """
         if quantization is None:
             return {}
 
-        if quantization == "4bit":
-            return {
-                "quantization_config": BitsAndBytesConfig(
-                    load_in_4bit=True,
-                    bnb_4bit_compute_dtype=torch.bfloat16,
-                    bnb_4bit_use_double_quant=True,
-                ),
-            }
-        elif quantization == "8bit":
-            return {
-                "quantization_config": BitsAndBytesConfig(load_in_8bit=True),
-            }
+        if quantization in ("4bit", "8bit"):
+            try:
+                import bitsandbytes  # noqa: F401
+            except ImportError:
+                raise ImportError(
+                    f"bitsandbytes is required for {quantization} quantization. "
+                    "Install with: pip install bitsandbytes"
+                )
+
+            if quantization == "4bit":
+                return {
+                    "quantization_config": BitsAndBytesConfig(
+                        load_in_4bit=True,
+                        bnb_4bit_compute_dtype=torch.bfloat16,
+                        bnb_4bit_use_double_quant=True,
+                    ),
+                }
+            elif quantization == "8bit":
+                return {
+                    "quantization_config": BitsAndBytesConfig(load_in_8bit=True),
+                }
         elif quantization in ("awq", "gptq"):
             # AWQ/GPTQ models are auto-detected by Transformers from
             # their quantize_config.json. We just pass device_map.
