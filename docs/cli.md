@@ -45,21 +45,85 @@ PEFT distillation of a draft model to a target model.
 
 Run full DistillSpec training pipeline.
 
+#### Core flags
+
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
 | `--draft` | `-d` | required | Draft model ID or path (e.g. `Qwen/Qwen2.5-0.5B`) |
 | `--target` | `-t` | required | Target model ID or path |
-| `--dataset` | | required | Hugging Face dataset ID |
+| `--dataset` | | required | Hugging Face dataset ID or local `save_to_disk` path |
 | `--text-column` | | `text` | Column containing text |
+| `--split` | | `auto` | Dataset split: auto, train_sft, train_gen, train, or custom |
 | `--lora-rank` | `-r` | `8` | LoRA rank (1–64) |
 | `--lora-alpha` | `-a` | `16` | LoRA alpha (1–128) |
 | `--epochs` | `-e` | `3` | Number of epochs (1–100) |
 | `--batch-size` | `-b` | `4` | Batch size per GPU |
 | `--learning-rate` | `-lr` | `5e-5` | Learning rate |
-| `--max-length` | `-ml` | `512` | Max token length (64–8192) |
+| `--max-length` | `-ml` | `512` | Max token length (64–16384) |
 | `--temperature` | `-T` | `1.0` | Distillation temperature |
 | `--output` | `-o` | `./draft-lora` | Output directory |
 | `--device` | | `auto` | Device: auto, cuda, cpu, mps |
+| `--backend` | | `auto` | Backend: auto, hf, unsloth |
+| `--draft-dtype` | | `bf16` | Draft precision: bf16 (full) or 4bit |
+
+#### Training tuning flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--grad-accum` | `1` | Gradient accumulation steps (effective batch = batch_size × this) |
+| `--warmup-steps` | `100` | Linear LR warmup steps |
+| `--max-grad-norm` | `1.0` | Gradient clipping max norm |
+| `--mixed-precision` | none | Mixed precision: bf16, fp16, or none (auto-detect) |
+
+#### On-policy generation flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--on-policy-regen-every` | `200` | Regenerate on-policy data every N steps (0 to disable) |
+| `--on-policy-tokens` | `64` | Continuation tokens per prompt (on-policy) |
+| `--on-policy-temp` | `0.7` | Generation temperature for on-policy data |
+
+#### Validation flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--validation-split` | `0.05` | Fraction of dataset for validation (0 to disable) |
+| `--val-prompts` | `20` | Number of prompts for validation |
+| `--val-draft-k` | `5` | Draft K for validation |
+| `--val-max-new-tokens` | `32` | Max new tokens per validation prompt |
+
+#### Logging & checkpointing flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--log-every` | `10` | Log metrics every N steps |
+| `--save-every` | `500` | Save checkpoint every N steps (requires `--checkpoint-dir`) |
+| `--checkpoint-dir` | none | Directory for checkpoints (enables checkpointing) |
+| `--resume-from` | none | Path to a checkpoint directory to resume from |
+
+**Examples:**
+
+```bash
+# Train draft with Unsloth (bf16 draft, 4-bit target) — smoke test
+sped distil run --backend unsloth --draft-dtype bf16 \
+  --draft Qwen/Qwen3-0.6B --target Qwen/Qwen3-8B \
+  --dataset ./ultrachat_200k_smoke --max-length 256 \
+  --validation-split 0 --epochs 1
+
+# Full training with checkpointing and gradient accumulation
+sped distil run --backend unsloth \
+  --draft Qwen/Qwen3-0.6B --target Qwen/Qwen3-8B \
+  --dataset ./ultrachat_200k_formatted --max-length 4096 \
+  --batch-size 1 --grad-accum 4 --epochs 3 \
+  --checkpoint-dir ./checkpoints --save-every 500
+
+# Resume from a checkpoint
+sped distil run ... --resume-from ./checkpoints/epoch_2
+```
+
+> **4-bit caching:** the first load with `--backend unsloth` quantizes the
+> target model (bf16 → NF4, ~2 min for 8B) and saves it to a
+> `{model}-4bit-cache` directory. Subsequent loads use the cache (~26s).
 
 ### `sped distil validate`
 
@@ -71,6 +135,9 @@ Validate a trained draft adapter.
 | `--target` | `-t` | required | Target model |
 | `--num-prompts` | `-n` | `100` | Validation prompts |
 | `--draft-k` | `-k` | `5` | Draft tokens per step |
+| `--backend` | | `auto` | Backend: auto, hf, unsloth |
+| `--draft-lora` | | none | LoRA adapter path to apply on top of draft |
+| `--target-4bit` | | false | (Unsloth) Load target in 4-bit |
 
 ---
 

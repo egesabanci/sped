@@ -31,6 +31,9 @@ Thumbs.db
 checkpoints/
 runs/
 
+# Unsloth compiled kernel cache (created during training/inference)
+unsloth_compiled_cache/
+
 # Docs
 site/
 
