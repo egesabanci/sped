@@ -530,7 +530,10 @@ class DistillSpec:
                     # Target forward: cached + autocast (#97, #98)
                     target_logits = self._get_target_logits(input_ids, attention_mask)
 
-                    draft_outputs = self.draft_model(input_ids, attention_mask=attention_mask)
+                    draft_outputs = self.draft_model(
+                        input_ids, attention_mask=attention_mask,
+                        use_cache=False,  # skip KV cache — not needed during training
+                    )
                     draft_logits = draft_outputs.logits
 
                     # ── KL divergence loss ─────────────────────────────
