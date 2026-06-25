@@ -397,11 +397,17 @@ def validate(
         rprint(f"\n[bold]Loading draft (Unsloth)[/bold]: [cyan]{draft}[/cyan]")
         with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), transient=True) as p:
             p.add_task("Loading draft...", total=None)
+            # When a LoRA adapter is provided, load the adapter dir directly:
+            # FastLanguageModel auto-loads the base model + applies the LoRA,
+            # returning a PeftModel. Wrapping again with PeftModel.from_pretrained
+            # would double-wrap and silently drop the adapter weights.
+            draft_load_id = str(draft_lora) if draft_lora is not None else draft
             draft_model, draft_tokenizer = load_unsloth_model(
-                draft, max_seq_length=4096, load_in_4bit=False,
+                draft_load_id, max_seq_length=4096, load_in_4bit=False,
                 device=device, verbose=True,
             )
-            if draft_lora is not None:
+            if draft_lora is not None and not hasattr(draft_model, "peft_config"):
+                # Fallback: backend did not auto-apply the adapter
                 from peft import PeftModel
                 draft_model = PeftModel.from_pretrained(draft_model, str(draft_lora))
             FastLanguageModel.for_inference(draft_model)

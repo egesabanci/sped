@@ -186,8 +186,17 @@ def run(
         logger.info(f"Loading draft model: {draft}")
         try:
             draft_backend = _create_backend(resolved_backend)
+            # When a LoRA adapter is provided:
+            #  - Unsloth: load the adapter dir directly; FastLanguageModel
+            #    auto-loads the base model (from adapter_config.json) AND
+            #    applies the LoRA, returning a PeftModel. Wrapping it again
+            #    with PeftModel.from_pretrained would double-wrap and the
+            #    adapter weights would be silently dropped.
+            #  - HF / others: load the base draft, then wrap with PeftModel.
+            draft_load_id = _resolve_draft_load_id(draft, draft_lora, resolved_backend)
+
             draft_backend.load_model(BackendConfig(
-                model_id=draft if draft_lora is None else str(draft_lora),
+                model_id=draft_load_id,
                 device=device,
                 dtype=dtype,
                 quantization=quantization,
@@ -196,12 +205,17 @@ def run(
             draft_tokenizer = draft_backend.tokenizer
 
             if draft_lora is not None:
-                try:
-                    from peft import PeftModel
-                    draft_model = PeftModel.from_pretrained(draft_model, str(draft_lora))
-                    logger.info(f"LoRA loaded from {draft_lora}")
-                except Exception as e:
-                    logger.warning(f"LoRA load failed: {e}")
+                # If the backend already applied the LoRA (Unsloth auto-load),
+                # the model is already a PeftModel — do NOT wrap again.
+                if hasattr(draft_model, "peft_config"):
+                    logger.info(f"LoRA loaded from {draft_lora} (auto-applied by backend)")
+                else:
+                    try:
+                        from peft import PeftModel
+                        draft_model = PeftModel.from_pretrained(draft_model, str(draft_lora))
+                        logger.info(f"LoRA loaded from {draft_lora}")
+                    except Exception as e:
+                        logger.warning(f"LoRA load failed: {e}")
 
             log_model_info(
                 logger, "Draft", draft, draft_backend.device,
@@ -269,6 +283,26 @@ def run(
 
 
 # ── Backend resolution ───────────────────────────────────
+
+
+def _resolve_draft_load_id(
+    draft: str, draft_lora: Optional[Path], backend: str,
+) -> str:
+    """Decide which model_id to pass to the draft backend.
+
+    For Unsloth with a LoRA adapter, load the adapter directory directly:
+    ``FastLanguageModel.from_pretrained`` reads ``adapter_config.json``,
+    loads the base model from ``base_model_name_or_path``, and applies the
+    LoRA — returning a PeftModel. Wrapping that again with
+    ``PeftModel.from_pretrained`` would double-wrap and silently drop the
+    adapter weights (all keys reported "missing").
+
+    For other backends, load the base draft and apply the LoRA via
+    ``PeftModel.from_pretrained`` afterwards.
+    """
+    if draft_lora is not None and backend == "unsloth":
+        return str(draft_lora)
+    return draft
 
 
 def _resolve_backend(backend: str, has_draft: bool = False) -> str:

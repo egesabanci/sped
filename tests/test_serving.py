@@ -189,6 +189,52 @@ class TestBackendResolution:
         assert isinstance(backend, HFBackend)
 
 
+# ── Draft LoRA load-id resolution tests ─────────────────
+
+
+class TestDraftLoRA_LOAD_ID:
+    """Tests for _resolve_draft_load_id — fixes the double-wrap bug where
+    Unsloth-saved LoRA adapters were silently dropped during serve (#85)."""
+
+    def test_unsloth_with_lora_loads_adapter_dir(self):
+        """Unsloth + draft_lora => load adapter dir (auto base+adapter)."""
+        from sped.cli.serve import _resolve_draft_load_id
+        from pathlib import Path
+        result = _resolve_draft_load_id(
+            "/data/models/Qwen3-0.6B", Path("/tmp/adapter"), "unsloth",
+        )
+        assert result == "/tmp/adapter"
+
+    def test_unsloth_without_lora_loads_base(self):
+        from sped.cli.serve import _resolve_draft_load_id
+        result = _resolve_draft_load_id("/data/models/Qwen3-0.6B", None, "unsloth")
+        assert result == "/data/models/Qwen3-0.6B"
+
+    def test_hf_with_lora_loads_base(self):
+        """HF backend + draft_lora => load base draft (PeftModel wraps later)."""
+        from sped.cli.serve import _resolve_draft_load_id
+        from pathlib import Path
+        result = _resolve_draft_load_id(
+            "/data/models/Qwen3-0.6B", Path("/tmp/adapter"), "hf",
+        )
+        assert result == "/data/models/Qwen3-0.6B"
+
+    def test_hf_without_lora_loads_base(self):
+        from sped.cli.serve import _resolve_draft_load_id
+        result = _resolve_draft_load_id("/data/models/Qwen3-0.6B", None, "hf")
+        assert result == "/data/models/Qwen3-0.6B"
+
+    def test_auto_backend_with_lora_loads_base(self):
+        """Non-unsloth backends never load the adapter dir as model_id."""
+        from sped.cli.serve import _resolve_draft_load_id
+        from pathlib import Path
+        for b in ("auto", "hf", "mlx", "vllm"):
+            result = _resolve_draft_load_id(
+                "/data/models/Qwen3-0.6B", Path("/tmp/adapter"), b,
+            )
+            assert result == "/data/models/Qwen3-0.6B"
+
+
 # ── Import Tests ─────────────────────────────────────────
 
 

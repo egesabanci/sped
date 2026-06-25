@@ -79,6 +79,18 @@ def load_unsloth_model(
     )
     cache = Path(cache_path)
 
+    # If the user passed an already-quantized cache directory directly
+    # (e.g. ``--target /data/models/X-4bit-cache``), don't append another
+    # ``-4bit-cache`` suffix — load it as-is.
+    if not cache.exists() and model_name.rstrip("/").endswith("-4bit-cache"):
+        return FastLanguageModel.from_pretrained(
+            model_name=model_name,
+            max_seq_length=max_seq_length,
+            dtype=dtype,
+            load_in_4bit=True,
+            device_map=device,
+        )
+
     if cache.exists():
         if verbose:
             print(f"  (loading from 4-bit cache: {cache_path})")
