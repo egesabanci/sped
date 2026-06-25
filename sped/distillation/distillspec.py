@@ -340,7 +340,7 @@ class DistillSpec:
         )
 
         optimizer = torch.optim.AdamW(
-            self.draft_model.parameters(), lr=learning_rate, fused=True,
+            self.draft_model.parameters(), lr=learning_rate,
         )
 
         # Split dataset
