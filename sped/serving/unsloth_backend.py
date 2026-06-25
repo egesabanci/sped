@@ -9,7 +9,18 @@ Usage:
 
 Install:
     pip install unsloth
+
+IMPORTANT: unsloth must be imported before torch, transformers, etc.
+This module-level import ensures the correct import order.
 """
+
+# unsloth must be imported before torch/transformers to apply its patches.
+# We use a try/except so the module is still importable on systems
+# where unsloth is not installed; the ImportError is caught by _create_backend.
+try:
+    import unsloth  # noqa: F401  # isort: skip
+except ImportError:
+    pass
 
 from time import time
 from typing import Optional
@@ -45,11 +56,12 @@ class UnslothBackend(InferenceBackend):
         """
         try:
             from unsloth import FastLanguageModel
-        except ImportError as e:
+        except ImportError:
+            # Module-level import failed; unsloth truly not available
             raise ImportError(
                 "Unsloth is required for the unsloth backend. "
                 "Install with: pip install unsloth"
-            ) from e
+            )
 
         self._device = self._resolve_device(config.device)
         self._max_length = config.max_length
