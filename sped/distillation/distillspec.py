@@ -56,6 +56,18 @@ def _is_unsloth_model(model) -> bool:
 
 def _apply_unsloth_lora(model, r: int = 8, lora_alpha: int = 16, **kwargs):
     from unsloth import FastLanguageModel
+
+    # Disable gradient checkpointing — frees all activations during forward
+    # so backward doesn't need to recompute them. Uses more VRAM (~4 GB at
+    # L=1480) but makes training ~26% faster.
+    #
+    # We use ``use_gradient_checkpointing="unsloth"`` first to let Unsloth
+    # set up ``_gradient_checkpointing_func`` on each decoder layer, then
+    # replace it with a no-op (identity) so the HF forward wrapper passes
+    # through without discarding/recomputing activations.
+    #
+    # Direct ``False`` crashes because the Unsloth fast forward expects
+    # the attribute to exist on every decoder layer.
     model = FastLanguageModel.get_peft_model(
         model,
         r=r,
@@ -69,6 +81,18 @@ def _apply_unsloth_lora(model, r: int = 8, lora_alpha: int = 16, **kwargs):
         **kwargs,
     )
     FastLanguageModel.for_training(model)
+
+    # Replace checkpointing with identity (no-op) on every decoder layer.
+    # This keeps all activations in memory — no recomputation during
+    # backward, at the cost of higher VRAM.
+    import logging as _lg
+    _lg.getLogger("transformers").setLevel(_lg.ERROR)
+    for module in model.modules():
+        if hasattr(module, "_gradient_checkpointing_func"):
+            module._gradient_checkpointing_func = (
+                lambda function, *args: function(*args)
+            )
+
     return model
 
 
