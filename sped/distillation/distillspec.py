@@ -108,9 +108,11 @@ class DistillSpec:
         self.target_tokenizer = target_tokenizer
         self.backend = backend
 
-        # Target logits cache (#97): hash(input_ids) -> logits tensor on CPU
-        # Cleared at the start of each epoch since on-policy data changes.
+        # Target logits cache (#97): hash(input_ids_row) -> unpadded logits on CPU
+        # Persists across epochs so epoch 2+ skips the 8B forward entirely.
         self._target_logits_cache: dict[int, torch.Tensor] = {}
+        # On-policy rotation index (#102): tracks which subset to regen next
+        self._on_policy_rotation_idx: int = 0
 
         use_unsloth = (
             backend == "unsloth" or (
@@ -184,6 +186,29 @@ class DistillSpec:
         logger.info(f"Pre-tokenized {len(tokenized)} examples in {elapsed:.1f}s")
         return tokenized
 
+    @staticmethod
+    def _collate_batch(batch: list[dict]) -> dict:
+        """Custom collate: pad input_ids to batch max length + attention_mask.
+
+        Without this, ``default_collate`` crashes on variable-length sequences.
+        """
+        import torch
+        max_len = max(len(item["input_ids"]) for item in batch)
+        ids_list = []
+        mask_list = []
+        for item in batch:
+            seq = item["input_ids"]
+            pad_len = max_len - len(seq)
+            ids_list.append(torch.cat([seq, torch.zeros(pad_len, dtype=seq.dtype)]))
+            mask_list.append(
+                torch.cat([torch.ones(len(seq), dtype=torch.long),
+                           torch.zeros(pad_len, dtype=torch.long)])
+            )
+        return {
+            "input_ids": torch.stack(ids_list),
+            "attention_mask": torch.stack(mask_list),
+        }
+
     # ── On-Policy Data Generation (#14) ──────────────────────────────
 
     def _generate_on_policy(
@@ -228,30 +253,60 @@ class DistillSpec:
 
     def _get_target_logits(
         self, input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Get target model logits with caching + bf16 autocast.
+        """Get target model logits with per-example caching + bf16 autocast.
 
-        Cache is keyed by input_id hash (frozen target = same logits for
-        same inputs across epochs). Uses bf16 autocast for ~1.5x speedup
-        on the frozen target forward.
+        Caches per-example (keyed on input_id hash of each row), NOT per-batch.
+        This means on epoch 2+ the target forward is skipped entirely even
+        though shuffling rearranges examples into different batch groups.
+
+        Cached logits are stored unpadded (only real token positions) and
+        repadded to the current batch's max length on retrieve.
         """
-        # Compute hash of input_ids for cache lookup
-        # Use Python's built-in hash on the raw bytes (fast, no GPU sync)
-        input_hash = hash(input_ids.cpu().numpy().tobytes())
+        B = input_ids.shape[0]
+        if B == 0:
+            return input_ids.new_zeros(0, 0, self.target_model.config.vocab_size)
 
-        # Check cache (#97)
-        if input_hash in self._target_logits_cache:
-            return self._target_logits_cache[input_hash].to(input_ids.device)
+        # ── Compute per-example hashes ────────────────────────────
+        example_hashes: list[int] = []
+        all_cached = True
+        for i in range(B):
+            h = hash(input_ids[i].cpu().numpy().tobytes())
+            example_hashes.append(h)
+            if h not in self._target_logits_cache:
+                all_cached = False
 
-        # bf16 autocast on frozen target forward (#98)
+        # ── Full cache hit: reconstruct batch from unpadded logits ──
+        if all_cached:
+            max_len = input_ids.shape[1]
+            logits_list = []
+            for i, h in enumerate(example_hashes):
+                cached = self._target_logits_cache[h]  # (1, real_len, V) on CPU
+                real_len = cached.shape[1]
+                pad_len = max_len - real_len
+                if pad_len > 0:
+                    cached = torch.nn.functional.pad(cached, (0, 0, 0, pad_len))
+                logits_list.append(cached.to(input_ids.device))
+            return torch.cat(logits_list, dim=0)  # (B, max_len, V)
+
+        # ── Cache miss: run forward ─────────────────────────────────
         with torch.no_grad(), torch.autocast(
             "cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available(),
         ):
-            target_outputs = self.target_model(input_ids)
+            target_outputs = self.target_model(input_ids, attention_mask=attention_mask)
             target_logits = target_outputs.logits
 
-        # Store cache on CPU to save GPU memory
-        self._target_logits_cache[input_hash] = target_logits.cpu()
+        # ── Store unpadded per-example logits on CPU ────────────────
+        for i in range(B):
+            h = example_hashes[i]
+            if h not in self._target_logits_cache:
+                if attention_mask is not None:
+                    real_len = int(attention_mask[i].sum().item())
+                else:
+                    real_len = input_ids.shape[1]
+                self._target_logits_cache[h] = target_logits[i:i+1, :real_len].cpu()
+
         return target_logits
 
     # ── Training Loop (#15) ──────────────────────────────────────────
@@ -347,7 +402,8 @@ class DistillSpec:
         )
         train_loader = DataLoader(
             tokenized_data, batch_size=batch_size, shuffle=True,
-            drop_last=True, num_workers=2, pin_memory=True,  # (#100)
+            drop_last=True, num_workers=2, pin_memory=True,
+            collate_fn=DistillSpec._collate_batch,  # (#99/#100 fix)
         )
 
         # ── Warmup: auto 5% of total steps if not specified (#101) ──
@@ -373,18 +429,15 @@ class DistillSpec:
             accelerator.load_state(str(resume_from))
             logger.info(f"Resumed from checkpoint: {resume_from}")
 
-        # On-policy data buffer (#102): store as list of prompt texts
-        on_policy_prompts: list[str] = []
+        # On-policy data buffer and rotation state (#102)
         on_policy_buffer = None
+        _on_pool_size = len(tokenized_data)  # total prompts available
 
         import time as _time
         _train_start = _time.time()
         _total_tokens = 0
 
         for epoch in range(start_epoch, num_epochs):
-            # Clear target logits cache at epoch boundary (#97)
-            self._target_logits_cache.clear()
-
             self.draft_model.train()
             total_loss = 0.0
             epoch_steps = 0
@@ -422,16 +475,19 @@ class DistillSpec:
                     # Incremental: only regenerate on_policy_fraction of
                     # prompts each cycle, not the entire buffer.
                     if (global_step % on_policy_regenerate_every == 0) or on_policy_buffer is None:
-                        # Decode some of the pre-tokenized inputs for on-policy gen
+                        n_regen = max(1, int(_on_pool_size * on_policy_fraction))
                         gen_prompts = []
-                        for j in range(min(on_policy_regenerate_every // len(train_loader) + 1, 8)):
-                            if j < len(tokenized_data):
-                                gen_prompts.append(
-                                    self.draft_tokenizer.decode(
-                                        tokenized_data[j % len(tokenized_data)]["input_ids"][:64],
-                                        skip_special_tokens=True,
-                                    )
+                        for k in range(n_regen):
+                            idx = (self._on_policy_rotation_idx + k) % _on_pool_size
+                            gen_prompts.append(
+                                self.draft_tokenizer.decode(
+                                    tokenized_data[idx]["input_ids"][:64],
+                                    skip_special_tokens=True,
                                 )
+                            )
+                        self._on_policy_rotation_idx = (
+                            self._on_policy_rotation_idx + n_regen
+                        ) % _on_pool_size
                         if gen_prompts:
                             on_policy_buffer = self._generate_on_policy(
                                 gen_prompts,
@@ -441,10 +497,15 @@ class DistillSpec:
                             )
 
                     # ── Forward through both models ────────────────────
-                    # Target forward: cached + autocast (#97, #98)
-                    target_logits = self._get_target_logits(input_ids)
+                    # batch is pre-tokenized with attention_mask from _collate_batch
+                    attention_mask = batch.get("attention_mask")
+                    if attention_mask is not None:
+                        attention_mask = attention_mask.to(accelerator.device)
 
-                    draft_outputs = self.draft_model(input_ids)
+                    # Target forward: cached + autocast (#97, #98)
+                    target_logits = self._get_target_logits(input_ids, attention_mask)
+
+                    draft_outputs = self.draft_model(input_ids, attention_mask=attention_mask)
                     draft_logits = draft_outputs.logits
 
                     # ── KL divergence loss ─────────────────────────────
