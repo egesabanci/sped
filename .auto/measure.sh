@@ -3,7 +3,7 @@ set -euo pipefail
 source /data/unsloth_env/bin/activate
 cd /data/sped
 
-# Measure optimal training throughput: bs=1 with per-example hidden-state cache
+# Test bf16 draft + cache for maximum throughput
 python3 << 'PYEOF'
 import sys, os, time, torch, gc
 sys.path.insert(0, '/data/sped')
@@ -21,13 +21,14 @@ from unsloth import FastLanguageModel
 from datasets import load_from_disk
 from sped.distillation.distillspec import DistillSpec
 
+# Load draft at bf16 (faster backward — no 4-bit dequant overhead)
 draft, tok = FastLanguageModel.from_pretrained(
-    '/data/models/Qwen3-1.7B-4bit-cache', max_seq_length=4096,
-    load_in_4bit=True, device_map='cuda',
+    '/data/models/Qwen3-1.7B',
+    max_seq_length=4096, load_in_4bit=False, device_map='cuda',
 )
 target, _ = FastLanguageModel.from_pretrained(
-    '/data/models/Qwen3-8B-4bit-cache', max_seq_length=4096,
-    load_in_4bit=True, device_map='cuda',
+    '/data/models/Qwen3-8B-4bit-cache',
+    max_seq_length=4096, load_in_4bit=True, device_map='cuda',
 )
 ds = load_from_disk('/data/ultrachat_200k_eval10')
 
@@ -65,10 +66,9 @@ vram = torch.cuda.max_memory_allocated() / 1e9
 tok_s = total_tokens / elapsed
 step_ms = elapsed / total_steps * 1000
 
-print(f"\n=== RESULTS (BS=1, per-example cache hit) ===")
+print(f"\n=== RESULTS (bf16 draft + cache hit) ===")
 print(f"Steps: {total_steps}, Tokens: {total_tokens}, Time: {elapsed:.1f}s")
 print(f"Tokens/sec: {tok_s:.0f}, Step time: {step_ms:.0f}ms, VRAM: {vram:.1f}GB")
-print(f"NOTE: target forward skipped via hidden-state cache")
 
 print(f"METRIC tokens_per_sec={tok_s:.0f}")
 print(f"METRIC step_time_ms={step_ms:.0f}")
