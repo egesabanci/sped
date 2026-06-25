@@ -266,32 +266,49 @@ class DistillSpec:
         self, input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Get target model logits with bf16 autocast and hidden-state caching.
+        """Get target model logits with bf16 autocast and per-example hidden-state caching.
 
-        Caches the intermediate hidden states (38× smaller than full logits)
-        so that repeated inputs across epochs skip the expensive 8B model
-        forward and only compute the cheap lm_head (a single linear layer).
-        Cache is bounded to ``_target_cache_max`` entries with FIFO eviction.
+        Cache keys are per-example (based on individual input_ids, not the padded batch)
+        so the cache works across any batch composition, shuffle order, and batch_size.
         """
-        # Build cache key once — used for both lookup and write
-        _key_cache = hash((
-            input_ids.cpu().numpy().tobytes(),
-            attention_mask.cpu().numpy().tobytes() if attention_mask is not None else b"",
-        ))
+        B = input_ids.shape[0]
+        dtype = torch.bfloat16
 
-        # ── Cache hit? ──────────────────────────────────────────────
-        if _key_cache in self._target_hidden_cache:
-            _, hidden_cpu = self._target_hidden_cache[_key_cache]
+        # ── Build per-example cache keys ────────────────────────────
+        keys = []
+        if attention_mask is not None:
+            for i in range(B):
+                real_len = int(attention_mask[i].sum().item())
+                example_ids = input_ids[i, :real_len]
+                keys.append(hash(example_ids.cpu().numpy().tobytes()))
+        else:
+            for i in range(B):
+                keys.append(hash(input_ids[i].cpu().numpy().tobytes()))
+
+        cached_mask = [k in self._target_hidden_cache for k in keys]
+
+        
+        # ── All cached: load from CPU, pad, apply lm_head ───────────
+        if all(cached_mask):
+            hidden_parts = []
+            for i, key in enumerate(keys):
+                _, hs_cpu = self._target_hidden_cache[key]
+                hidden_parts.append(hs_cpu.to(device=input_ids.device, dtype=dtype))
+            max_ex_len = max(h.shape[1] for h in hidden_parts)
+            padded = torch.stack([
+                torch.nn.functional.pad(h, (0, 0, 0, max_ex_len - h.shape[1]))
+                for h in hidden_parts
+            ])
             with torch.inference_mode(), torch.autocast(
-                "cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available(),
+                "cuda", dtype=dtype, enabled=torch.cuda.is_available(),
             ):
-                hidden = hidden_cpu.to(device=input_ids.device, dtype=torch.bfloat16)
-                logits = self.target_model.lm_head(hidden)
+                logits = self.target_model.lm_head(padded)
             return logits
 
-        # ── Cache miss: compute forward ─────────────────────────────
+        
+        # ── Cache miss: compute full batch, cache per-example ───────
         with torch.inference_mode(), torch.autocast(
-            "cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available(),
+            "cuda", dtype=dtype, enabled=torch.cuda.is_available(),
         ):
             try:
                 from xformers.ops import LowerTriangularMask
@@ -301,24 +318,30 @@ class DistillSpec:
 
             if hasattr(self.target_model, "model") and causal_mask is not None:
                 base_out = self.target_model.model(
-                    input_ids,
-                    attention_mask=attention_mask,
-                    causal_mask=causal_mask,
-                    use_cache=False,
-                    return_dict=True,
+                    input_ids, attention_mask=attention_mask,
+                    causal_mask=causal_mask, use_cache=False, return_dict=True,
                 )
-                hidden = base_out.last_hidden_state
-                # Cache hidden states on CPU (38× smaller than logits)
-                hidden_cpu = hidden.cpu().to(torch.bfloat16)
-                self._target_hidden_cache[_key_cache] = (_key_cache, hidden_cpu)
+                hidden = base_out.last_hidden_state  # (B, L, H)
+
+                # Cache each example individually (non-padded portion only)
+                for i in range(B):
+                    if not cached_mask[i]:  # don't re-cache already cached
+                        if attention_mask is not None:
+                            real_len = int(attention_mask[i].sum().item())
+                            ex_hidden = hidden[i, :real_len, :].unsqueeze(0)
+                        else:
+                            ex_hidden = hidden[i].unsqueeze(0)
+                        self._target_hidden_cache[keys[i]] = (
+                            keys[i], ex_hidden.cpu().to(dtype),
+                        )
+
                 # FIFO eviction if over cap
-                if len(self._target_hidden_cache) > self._target_cache_max:
-                    oldest_key = next(iter(self._target_hidden_cache))
-                    del self._target_hidden_cache[oldest_key]
-                # Apply lm_head
-                logits = self.target_model.lm_head(hidden.to(torch.bfloat16))
+                while len(self._target_hidden_cache) > self._target_cache_max:
+                    oldest = next(iter(self._target_hidden_cache))
+                    del self._target_hidden_cache[oldest]
+
+                logits = self.target_model.lm_head(hidden.to(dtype))
             else:
-                # Fallback: full model forward (no xformers — no caching possible)
                 target_outputs = self.target_model(input_ids, attention_mask=attention_mask)
                 logits = target_outputs.logits
 
@@ -705,13 +728,29 @@ class DistillSpec:
         teacher_logits: torch.Tensor,
         temperature: float,
         attention_mask: Optional[torch.Tensor] = None,
+        chunk_size: int = 512,  # chunk over L to reduce peak fp32 memory
     ) -> torch.Tensor:
-        student_log_probs = torch.log_softmax(student_logits / temperature, dim=-1)
-        teacher_log_probs = torch.log_softmax(teacher_logits / temperature, dim=-1)
-        teacher_probs = teacher_log_probs.exp()
-        per_token_kl = (
-            teacher_probs * (teacher_log_probs - student_log_probs)
-        ).sum(dim=-1)  # (B, L)
+        """KL divergence with chunking over sequence dimension.
+
+        For large vocabulary models (Qwen3: 151k), the softmax + KL
+        allocation in fp32 can OOM at longer seq lengths. Chunking
+        reduces peak memory proportionally (e.g. 512/1480 = 35%).
+        """
+        B, L, V = student_logits.shape
+        # Chunk over sequence dimension to limit peak fp32 memory
+        per_token_kl_parts = []
+        for start in range(0, L, chunk_size):
+            end = min(start + chunk_size, L)
+            slp = torch.log_softmax(
+                student_logits[:, start:end] / temperature, dim=-1,
+            )
+            tlp = torch.log_softmax(
+                teacher_logits[:, start:end] / temperature, dim=-1,
+            )
+            tp = tlp.exp()
+            part_kl = (tp * (tlp - slp)).sum(dim=-1)  # (B, chunk)
+            per_token_kl_parts.append(part_kl)
+        per_token_kl = torch.cat(per_token_kl_parts, dim=1)  # (B, L)
         # Mask out padding positions if attention_mask is provided
         if attention_mask is not None:
             per_token_kl = per_token_kl * attention_mask.float()

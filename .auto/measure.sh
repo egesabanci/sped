@@ -3,7 +3,7 @@ set -euo pipefail
 source /data/unsloth_env/bin/activate
 cd /data/sped
 
-# Measure cache-hit throughput (epoch 2+ behavior at batch_size=1)
+# Measure cache-hit throughput with per-example cache (works at any batch_size)
 python3 << 'PYEOF'
 import sys, os, time, torch, gc
 sys.path.insert(0, '/data/sped')
@@ -40,30 +40,32 @@ for i in range(len(ds)):
     encoded = tok(text, truncation=True, max_length=4096, return_tensors='pt')
     tokenized.append({'input_ids': encoded.input_ids[0]})
 
-# Warmup: populate hidden-state cache (simulating epoch 1 cache writes)
+# Warmup: populate cache with per-example keys (using bs=1)
+print("Warming up cache (bs=1)...")
 for batch_data in tokenized:
     batch = DistillSpec._collate_batch([batch_data])
     _ = spec._get_target_logits(batch['input_ids'].cuda(), batch['attention_mask'].cuda())
 print(f"Cache: {len(spec._target_hidden_cache)} entries")
 
-# Timed epoch: all cache hits (simulating epoch 2+)
+# Test bs=2 with cache hit (per-example keys should match)
 opt = torch.optim.AdamW(spec.draft_model.parameters(), lr=5e-5)
 t_start = time.time()
 total_tokens = 0
 total_steps = 0
 
-for batch_data in tokenized:
-    batch = DistillSpec._collate_batch([batch_data])
-    input_ids = batch['input_ids'].cuda()
-    attn_mask = batch['attention_mask'].cuda()
-    n_tokens = attn_mask.sum().item()
-    total_tokens += n_tokens
+for i in range(0, len(tokenized), 2):
+    batch_data = tokenized[i:i+2]
+    batch = DistillSpec._collate_batch(batch_data)
+    ids = batch['input_ids'].cuda()
+    am = batch['attention_mask'].cuda()
+    ntok = am.sum().item()
+    total_tokens += ntok
     total_steps += 1
 
-    # Cache hit: loads hidden from CPU→GPU, computes lm_head only
-    tl = spec._get_target_logits(input_ids, attn_mask)
-    do = spec.draft_model(input_ids, attention_mask=attn_mask).logits
-    loss = DistillSpec._kl_divergence(do, tl, 1.0, attn_mask)
+    # Cache hit: per-example keys match bs=1 warmup
+    tl = spec._get_target_logits(ids, am)
+    do = spec.draft_model(ids, attention_mask=am).logits
+    loss = DistillSpec._kl_divergence(do, tl, 1.0, am)
     loss.backward()
     opt.step()
     opt.zero_grad()
@@ -75,10 +77,10 @@ tok_s = total_tokens / elapsed
 step_ms = elapsed / total_steps * 1000
 mean_len = total_tokens / total_steps
 
-print(f"\n=== RESULTS (CACHE HIT — epoch 2+, bs=1) ===")
+print(f"\n=== RESULTS (BS=2, per-example cache hit) ===")
 print(f"Steps: {total_steps}, Tokens: {total_tokens}, Time: {elapsed:.1f}s")
 print(f"Tokens/sec: {tok_s:.0f}, Step time: {step_ms:.0f}ms, VRAM: {vram:.1f}GB")
-print(f"NOTE: target forward skipped via hidden-state cache hit")
+print(f"NOTE: per-example cache — works across batch compositions")
 
 print(f"METRIC tokens_per_sec={tok_s:.0f}")
 print(f"METRIC step_time_ms={step_ms:.0f}")
