@@ -690,17 +690,29 @@ class DistillSpec:
         teacher_logits: torch.Tensor,
         temperature: float,
     ) -> torch.Tensor:
-        """Compute KL divergence between student and teacher distributions."""
+        """Compute per-token KL(teacher || student) divergence.
+
+        Returns the mean KL over all batch and sequence positions (NOT a
+        sum over positions), so the loss scale is independent of sequence
+        length. Typical values are ~0.1-5 nats per token.
+
+        PyTorch's ``kl_div(reduction="batchmean")`` sums over the sequence
+        dimension, which makes the loss scale with sequence length and
+        produces huge values (100s-1000s) for long sequences. We instead
+        compute the per-token KL and average over batch + sequence.
+        """
         student_log_probs = torch.log_softmax(
             student_logits / temperature, dim=-1
         )
-        teacher_probs = torch.softmax(
+        teacher_log_probs = torch.log_softmax(
             teacher_logits / temperature, dim=-1
         )
-        kl = torch.nn.functional.kl_div(
-            student_log_probs, teacher_probs,
-            reduction="batchmean", log_target=False,
-        )
+        teacher_probs = teacher_log_probs.exp()
+        # Per-token KL: sum over vocab -> (B, L), then mean over batch + seq
+        per_token_kl = (
+            teacher_probs * (teacher_log_probs - student_log_probs)
+        ).sum(dim=-1)
+        kl = per_token_kl.mean()
         return kl * (temperature ** 2)
 
     def save_adapter(self, path: Path):
