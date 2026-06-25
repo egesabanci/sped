@@ -108,9 +108,6 @@ class DistillSpec:
         self.target_tokenizer = target_tokenizer
         self.backend = backend
 
-        # Target logits cache (#97): hash(input_ids_row) -> unpadded logits on CPU
-        # Persists across epochs so epoch 2+ skips the 8B forward entirely.
-        self._target_logits_cache: dict[int, torch.Tensor] = {}
         # On-policy rotation index (#102): tracks which subset to regen next
         self._on_policy_rotation_idx: int = 0
 
@@ -255,59 +252,20 @@ class DistillSpec:
         self, input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Get target model logits with per-example caching + bf16 autocast.
+        """Get target model logits with bf16 autocast.
 
-        Caches per-example (keyed on input_id hash of each row), NOT per-batch.
-        This means on epoch 2+ the target forward is skipped entirely even
-        though shuffling rearranges examples into different batch groups.
-
-        Cached logits are stored unpadded (only real token positions) and
-        repadded to the current batch's max length on retrieve.
+        NOTE: per-example caching was attempted but removed because
+        storing full-vocab logits (151k tokens) at 4096 seq length
+        consumes 1.2 GB per example on CPU RAM — the system OOMs
+        after ~13 steps. Only bf16 autocast is applied for ~1.5x
+        speedup on the frozen target forward.
         """
-        B = input_ids.shape[0]
-        if B == 0:
-            return input_ids.new_zeros(0, 0, self.target_model.config.vocab_size)
-
-        # ── Compute per-example hashes ────────────────────────────
-        example_hashes: list[int] = []
-        all_cached = True
-        for i in range(B):
-            h = hash(input_ids[i].cpu().numpy().tobytes())
-            example_hashes.append(h)
-            if h not in self._target_logits_cache:
-                all_cached = False
-
-        # ── Full cache hit: reconstruct batch from unpadded logits ──
-        if all_cached:
-            max_len = input_ids.shape[1]
-            logits_list = []
-            for i, h in enumerate(example_hashes):
-                cached = self._target_logits_cache[h]  # (1, real_len, V) on CPU
-                real_len = cached.shape[1]
-                pad_len = max_len - real_len
-                if pad_len > 0:
-                    cached = torch.nn.functional.pad(cached, (0, 0, 0, pad_len))
-                logits_list.append(cached.to(input_ids.device))
-            return torch.cat(logits_list, dim=0)  # (B, max_len, V)
-
-        # ── Cache miss: run forward ─────────────────────────────────
+        # bf16 autocast on frozen target forward (#98)
         with torch.no_grad(), torch.autocast(
             "cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available(),
         ):
             target_outputs = self.target_model(input_ids, attention_mask=attention_mask)
-            target_logits = target_outputs.logits
-
-        # ── Store unpadded per-example logits on CPU ────────────────
-        for i in range(B):
-            h = example_hashes[i]
-            if h not in self._target_logits_cache:
-                if attention_mask is not None:
-                    real_len = int(attention_mask[i].sum().item())
-                else:
-                    real_len = input_ids.shape[1]
-                self._target_logits_cache[h] = target_logits[i:i+1, :real_len].cpu()
-
-        return target_logits
+            return target_outputs.logits
 
     # ── Training Loop (#15) ──────────────────────────────────────────
 
@@ -402,8 +360,8 @@ class DistillSpec:
         )
         train_loader = DataLoader(
             tokenized_data, batch_size=batch_size, shuffle=True,
-            drop_last=True, num_workers=2, pin_memory=True,
-            collate_fn=DistillSpec._collate_batch,  # (#99/#100 fix)
+            drop_last=True,  # workers=0: no multiprocessing (avoids deadlocks)
+            collate_fn=DistillSpec._collate_batch,
         )
 
         # ── Warmup: auto 5% of total steps if not specified (#101) ──
@@ -431,7 +389,6 @@ class DistillSpec:
 
         # On-policy data buffer and rotation state (#102)
         on_policy_buffer = None
-        _on_pool_size = len(tokenized_data)  # total prompts available
 
         import time as _time
         _train_start = _time.time()
@@ -472,13 +429,14 @@ class DistillSpec:
                     _total_tokens += _batch_tokens
 
                     # ── On-policy data regeneration (#102) ───────────
-                    # Incremental: only regenerate on_policy_fraction of
-                    # prompts each cycle, not the entire buffer.
+                    # Maintain a small rotating buffer of prompts (size = 4).
+                    # Each cycle, regenerate only on_policy_fraction of them.
+                    _OP_BUFFER_SIZE = 4
                     if (global_step % on_policy_regenerate_every == 0) or on_policy_buffer is None:
-                        n_regen = max(1, int(_on_pool_size * on_policy_fraction))
+                        n_regen = max(1, int(_OP_BUFFER_SIZE * on_policy_fraction))
                         gen_prompts = []
                         for k in range(n_regen):
-                            idx = (self._on_policy_rotation_idx + k) % _on_pool_size
+                            idx = (self._on_policy_rotation_idx + k) % len(tokenized_data)
                             gen_prompts.append(
                                 self.draft_tokenizer.decode(
                                     tokenized_data[idx]["input_ids"][:64],
@@ -487,13 +445,13 @@ class DistillSpec:
                             )
                         self._on_policy_rotation_idx = (
                             self._on_policy_rotation_idx + n_regen
-                        ) % _on_pool_size
+                        ) % len(tokenized_data)
                         if gen_prompts:
                             on_policy_buffer = self._generate_on_policy(
                                 gen_prompts,
                                 gen_temperature=on_policy_gen_temp,
                                 gen_tokens_per_prompt=on_policy_tokens_per_prompt,
-                                max_prompt_length=max_length,
+                                max_prompt_length=min(max_length, 512),  # cap for speed
                             )
 
                     # ── Forward through both models ────────────────────
