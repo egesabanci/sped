@@ -31,11 +31,18 @@ from rich.table import Table
 from rich.console import Console
 from rich.prompt import Prompt
 
+# unsloth must be imported before torch/transformers to apply its patches.
+# This must be the very first sped import to catch the import before any
+# backend (hf_backend, etc.) triggers torch/transformers.
+try:
+    import unsloth  # noqa: F401
+except ImportError:
+    pass
+
 from sped.serving import BackendConfig
 
-# Import UnslothBackend first so unsloth patches torch/transformers
-# before any other backend imports them. The ImportError is caught
-# so the module works fine without unsloth installed.
+# Import UnslothBackend (also triggers the module-level unsloth import
+# inside unsloth_backend.py, but that's harmless since we already did it above).
 try:
     from sped.serving.unsloth_backend import UnslothBackend
 except ImportError:

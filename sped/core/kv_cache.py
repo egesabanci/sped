@@ -33,6 +33,21 @@ class KVCacheManager:
         self.cache: Optional[tuple[tuple[torch.Tensor, ...], ...]] = None
         self.base_seq_len: int = 0  # length before draft speculation
 
+    @staticmethod
+    def _unpack_output(outputs):
+        """Extract logits and past_key_values from a model forward pass.
+
+        Handles three output formats:
+        1. HF CausalLMOutputWithPast: has .logits and .past_key_values
+        2. Unsloth fast-inference: returns (logits, pkv, ...) as tuple
+        """
+        if hasattr(outputs, "logits"):
+            return outputs.logits, outputs.past_key_values
+        # Unsloth fast path returns (logits, pkv, ...) tuple
+        logits = outputs[0]
+        pkv = outputs[1]
+        return logits, pkv
+
     def reset(self):
         """Clear the cache entirely."""
         self.cache = None
@@ -53,9 +68,10 @@ class KVCacheManager:
             use_cache=True,
             past_key_values=None,
         )
-        self.cache = outputs.past_key_values
+        logits, pkv = self._unpack_output(outputs)
+        self.cache = pkv
         self.base_seq_len = input_ids.shape[-1]
-        return outputs.logits
+        return logits
 
     @torch.no_grad()
     def extend(
@@ -73,14 +89,25 @@ class KVCacheManager:
         if self.cache is None:
             return self.prefill(token_ids)
 
+        # Compute position_ids for new tokens (required by unsloth's patched forward)
+        n_new = token_ids.shape[-1]
+        position_ids = torch.arange(
+            self.base_seq_len,
+            self.base_seq_len + n_new,
+            dtype=torch.long,
+            device=token_ids.device,
+        ).unsqueeze(0)
+
         outputs = self.model(
             token_ids,
+            position_ids=position_ids,
             use_cache=True,
             past_key_values=self.cache,
         )
-        self.cache = outputs.past_key_values
-        self.base_seq_len += token_ids.shape[-1]
-        return outputs.logits
+        logits, pkv = self._unpack_output(outputs)
+        self.cache = pkv
+        self.base_seq_len += n_new
+        return logits
 
     @torch.no_grad()
     def verify_draft(
@@ -88,10 +115,13 @@ class KVCacheManager:
         input_ids: torch.Tensor,
         draft_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """Verify draft tokens in a single forward pass using the KV cache.
+        """Verify draft tokens in a single forward pass.
 
-        Uses the cached prefix and only computes attention for the new
-        draft positions.
+        Does a full forward pass through the combined sequence (prefix +
+        draft tokens). This avoids unsloth's fast inference path which
+        only handles single-token extension.
+
+        The KV cache is updated with the new sequence after verification.
 
         Args:
             input_ids: Shape (1, seq_len) — known prefix.
@@ -101,14 +131,16 @@ class KVCacheManager:
             logits at each draft position (1, draft_k, vocab_size).
         """
         combined = torch.cat([input_ids, draft_ids], dim=-1)
+        # Full forward pass — no KV cache (avoids unsloth's q_len=1 assert)
         outputs = self.model(
             combined,
             use_cache=True,
-            past_key_values=self.cache,
+            past_key_values=None,
         )
+        logits, pkv = self._unpack_output(outputs)
         # Return logits at draft positions only
-        logits = outputs.logits[:, input_ids.shape[-1] - 1 : -1, :]
-        self.cache = outputs.past_key_values
+        logits = logits[:, input_ids.shape[-1] - 1 : -1, :]
+        self.cache = pkv
         self.base_seq_len = combined.shape[-1]
         return logits
 

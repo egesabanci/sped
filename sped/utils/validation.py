@@ -10,7 +10,7 @@ from typing import Optional
 
 
 VALID_DEVICES = {"auto", "cpu", "cuda", "mps"}
-VALID_BACKENDS = {"auto", "hf", "mlx", "vllm"}
+VALID_BACKENDS = {"auto", "hf", "mlx", "vllm", "unsloth"}
 VALID_ALIGNMENTS = {"auto", "none", "string", "probabilistic", "hybrid"}
 VALID_OUTPUT_FORMATS = {"text", "json", "silent"}
 VALID_LOG_LEVELS = {"debug", "info", "warn", "error"}
