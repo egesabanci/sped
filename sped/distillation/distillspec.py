@@ -39,6 +39,15 @@ def _is_unsloth_available() -> bool:
         return False
 
 
+def _get_xformers_mask():
+    """Get the xformers lower-triangular causal mask for Unsloth models."""
+    try:
+        from xformers.ops import LowerTriangularMask
+        return LowerTriangularMask()
+    except ImportError:
+        return None
+
+
 def _is_unsloth_model(model) -> bool:
     return hasattr(model, "_saved_temp_tokenizer") or any(
         hasattr(model, attr) for attr in ("_unloth_model", "_unsloth_model")
@@ -110,6 +119,11 @@ class DistillSpec:
 
         # On-policy rotation index (#102): tracks which subset to regen next
         self._on_policy_rotation_idx: int = 0
+        # Target hidden-state cache: {bytes_hash: (attention_mask_hash, hidden_states_cpu)}
+        # Hidden states are 38× smaller than logits (33.5 MB vs 1.24 GB at L=4096)
+        # Cache is bounded to prevent OOM on large datasets
+        self._target_hidden_cache: dict = {}
+        self._target_cache_max: int = 200  # ~6.7 GB at L=4096 max, scales to ~40% of smoke dataset
 
         use_unsloth = (
             backend == "unsloth" or (
@@ -252,20 +266,75 @@ class DistillSpec:
         self, input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Get target model logits with bf16 autocast.
+        """Get target model logits with bf16 autocast and hidden-state caching.
 
-        NOTE: per-example caching was attempted but removed because
-        storing full-vocab logits (151k tokens) at 4096 seq length
-        consumes 1.2 GB per example on CPU RAM — the system OOMs
-        after ~13 steps. Only bf16 autocast is applied for ~1.5x
-        speedup on the frozen target forward.
+        Caches the intermediate hidden states (38× smaller than full logits)
+        so that repeated inputs across epochs skip the expensive 8B model
+        forward and only compute the cheap lm_head (a single linear layer).
+        Cache is bounded to ``_target_cache_max`` entries (~1.7 GB at max
+        seq_len=4096) with FIFO eviction.
         """
-        # bf16 autocast on frozen target forward (#98)
+        # ── Cache hit? ──────────────────────────────────────────────
+        if self._target_hidden_cache is not None and len(self._target_hidden_cache) > 0:
+            # Build cache key: hash of (input_ids_bytes, attention_mask_bytes)
+            key = hash((
+                input_ids.cpu().numpy().tobytes(),
+                attention_mask.cpu().numpy().tobytes() if attention_mask is not None else b"",
+            ))
+            if key in self._target_hidden_cache:
+                _, hidden_cpu = self._target_hidden_cache[key]
+                with torch.inference_mode(), torch.autocast(
+                    "cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available(),
+                ):
+                    # Load cached hidden states to GPU and apply lm_head
+                    hidden = hidden_cpu.to(device=input_ids.device, dtype=torch.bfloat16)
+                    logits = self.target_model.lm_head(hidden)
+                return logits
+
+        # ── Cache miss: compute forward ─────────────────────────────
         with torch.inference_mode(), torch.autocast(
             "cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available(),
         ):
-            target_outputs = self.target_model(input_ids, attention_mask=attention_mask)
-            return target_outputs.logits
+            # Use model + lm_head split so we can cache the (small) hidden states.
+            # The xformers causal mask is required to match the Unsloth fast forward;
+            # without it, model + lm_head produces different logits than the full forward.
+            try:
+                from xformers.ops import LowerTriangularMask
+                causal_mask = LowerTriangularMask()
+            except ImportError:
+                causal_mask = None
+
+            # Run the base model to get hidden states
+            if hasattr(self.target_model, "model") and causal_mask is not None:
+                base_out = self.target_model.model(
+                    input_ids,
+                    attention_mask=attention_mask,
+                    causal_mask=causal_mask,
+                    use_cache=False,
+                    return_dict=True,
+                )
+                hidden = base_out.last_hidden_state
+                # Cache hidden states on CPU (38× smaller than logits)
+                if self._target_hidden_cache is not None:
+                    key = hash((
+                        input_ids.cpu().numpy().tobytes(),
+                        attention_mask.cpu().numpy().tobytes() if attention_mask is not None else b"",
+                    ))
+                    hidden_cpu = hidden.cpu().to(torch.bfloat16)
+                    self._target_hidden_cache[key] = (key, hidden_cpu)
+                    # Evict oldest if over cap
+                    if len(self._target_hidden_cache) > self._target_cache_max:
+                        # FIFO eviction: remove first inserted entry
+                        oldest_key = next(iter(self._target_hidden_cache))
+                        del self._target_hidden_cache[oldest_key]
+                # Apply lm_head to get logits
+                logits = self.target_model.lm_head(hidden.to(torch.bfloat16))
+            else:
+                # Fallback: full model forward (no caching)
+                target_outputs = self.target_model(input_ids, attention_mask=attention_mask)
+                logits = target_outputs.logits
+
+        return logits
 
     # ── Training Loop (#15) ──────────────────────────────────────────
 

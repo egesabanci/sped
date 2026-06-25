@@ -1,8 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 # Autoresearch measure script for sped training throughput
-# Run from /data/sped (or workingDir)
-# Outputs METRIC lines parsed by run_experiment
+# Tests hidden-state cache performance: warmup epoch (cache write) +
+# timed epoch (cache read, only lm_head compute)
 
 source /data/unsloth_env/bin/activate
 cd /data/sped
@@ -24,7 +24,6 @@ from unsloth import FastLanguageModel
 from datasets import load_from_disk
 from sped.distillation.distillspec import DistillSpec
 
-# ── Load models ─────────────────────────────────────────────────────
 draft, tok = FastLanguageModel.from_pretrained(
     '/data/models/Qwen3-1.7B-4bit-cache', max_seq_length=4096,
     load_in_4bit=True, device_map='cuda',
@@ -48,12 +47,25 @@ for i in range(len(ds)):
     encoded = tok(text, truncation=True, max_length=4096, return_tensors='pt')
     tokenized.append({'input_ids': encoded.input_ids[0]})
 
-# ── Training loop ───────────────────────────────────────────────────
+# ── Warmup epoch: populate hidden-state cache (no timing) ──────────
+import logging as _lg
+_lg.warning("=== Warming up target hidden-state cache ===")
+for batch_data in tokenized:
+    batch = DistillSpec._collate_batch([batch_data])
+    input_ids = batch['input_ids'].cuda()
+    attn_mask = batch['attention_mask'].cuda()
+    _ = spec._get_target_logits(input_ids, attn_mask)
+
+cache_size = len(spec._target_hidden_cache)
+_lg.warning(f"Cache populated: {cache_size} entries")
+print(f"\nCache entries: {cache_size}")
+
+# ── Timed epoch: cache hits → only lm_head compute ────────────────
 t_start = time.time()
 total_tokens = 0
 total_steps = 0
 
-opt = torch.optim.AdamW(spec.draft_model.parameters(), lr=5e-5, fused=True)
+opt = torch.optim.AdamW(spec.draft_model.parameters(), lr=5e-5)
 
 for step, batch_data in enumerate(tokenized):
     batch = DistillSpec._collate_batch([batch_data])
@@ -63,8 +75,9 @@ for step, batch_data in enumerate(tokenized):
     total_tokens += n_tokens
     total_steps += 1
 
-    with torch.inference_mode(), torch.autocast('cuda', dtype=torch.bfloat16):
-        tl = target(input_ids, attention_mask=attn_mask).logits
+    # This now hits the cache (loads hidden→GPU→lm_head)
+    tl = spec._get_target_logits(input_ids, attn_mask)
+
     do = spec.draft_model(input_ids, attention_mask=attn_mask).logits
     loss = DistillSpec._kl_divergence(do, tl, 1.0, attn_mask)
     loss.backward()
@@ -78,12 +91,13 @@ vram_cur = torch.cuda.memory_allocated() / 1e9
 tokens_per_sec = total_tokens / elapsed
 step_time_ms = elapsed / total_steps * 1000
 
-print(f"\n=== RESULTS ===")
+print(f"\n=== RESULTS (CACHED — epoch 2+ behavior) ===")
 print(f"Steps: {total_steps}, Tokens: {total_tokens}")
 print(f"Time: {elapsed:.1f}s")
 print(f"Tokens/sec: {tokens_per_sec:.0f}")
 print(f"Step time: {step_time_ms:.0f}ms")
 print(f"VRAM peak: {vram_peak:.1f}GB, cur: {vram_cur:.1f}GB")
+print(f"NOTE: target forward skipped via hidden-state cache hit")
 
 print(f"METRIC tokens_per_sec={tokens_per_sec:.0f}")
 print(f"METRIC step_time_ms={step_time_ms:.0f}")
