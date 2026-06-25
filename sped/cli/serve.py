@@ -32,6 +32,15 @@ from rich.console import Console
 from rich.prompt import Prompt
 
 from sped.serving import BackendConfig
+
+# Import UnslothBackend first so unsloth patches torch/transformers
+# before any other backend imports them. The ImportError is caught
+# so the module works fine without unsloth installed.
+try:
+    from sped.serving.unsloth_backend import UnslothBackend
+except ImportError:
+    UnslothBackend = None  # type: ignore
+
 from sped.serving.hf_backend import HFBackend
 
 from sped.utils.validation import (
@@ -266,12 +275,8 @@ def _resolve_backend(backend: str, has_draft: bool = False) -> str:
     if has_draft:
         return "hf"
     # Auto-detect: try most optimized first
-    try:
-        from sped.serving.unsloth_backend import UnslothBackend
-        if UnslothBackend.is_available():
-            return "unsloth"
-    except ImportError:
-        pass
+    if UnslothBackend is not None and UnslothBackend.is_available():
+        return "unsloth"
     try:
         from sped.serving.mlx_backend import MLXBackend
         if MLXBackend.is_available():
@@ -283,13 +288,11 @@ def _resolve_backend(backend: str, has_draft: bool = False) -> str:
 
 def _create_backend(backend: str):
     if backend == "unsloth":
-        try:
-            from sped.serving.unsloth_backend import UnslothBackend
+        if UnslothBackend is not None:
             return UnslothBackend()
-        except ImportError:
-            logger = get_logger()
-            logger.warning("Unsloth not installed. Falling back to HF.")
-            return HFBackend()
+        logger = get_logger()
+        logger.warning("Unsloth not installed. Falling back to HF.")
+        return HFBackend()
     elif backend == "mlx":
         try:
             from sped.serving.mlx_backend import MLXBackend
