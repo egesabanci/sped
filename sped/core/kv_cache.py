@@ -115,23 +115,58 @@ class KVCacheManager:
         input_ids: torch.Tensor,
         draft_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """Verify draft tokens in a single forward pass.
+        """Verify draft tokens incrementally using KV cache.
 
-        Does a full forward pass through the combined sequence (prefix +
-        draft tokens). This avoids unsloth's fast inference path which
-        only handles single-token extension.
+        Uses the existing KV cache to process only the K draft tokens,
+        avoiding a full forward pass over the entire context.
 
-        The KV cache is updated with the new sequence after verification.
+        Falls back to full forward if:
+        - No cache is available (cold start)
+        - Unsloth's fast path rejects multi-token extension
 
         Args:
-            input_ids: Shape (1, seq_len) — known prefix.
+            input_ids: Shape (1, seq_len) — known prefix (used for fallback only).
             draft_ids: Shape (1, draft_k) — candidate draft tokens.
 
         Returns:
             logits at each draft position (1, draft_k, vocab_size).
         """
+        draft_k = draft_ids.shape[-1]
+
+        if self.cache is not None:
+            # Attempt incremental: extend cache with draft tokens
+            try:
+                logits = self.extend(draft_ids)
+                # extend() advances base_seq_len by draft_k; we need to rollback
+                # to the pre-draft state since verification hasn't been committed yet
+                self.base_seq_len -= draft_k
+                # Return logits at each draft position
+                return logits[:, -draft_k:, :]
+            except (RuntimeError, AssertionError):
+                # Unsloth fast path may reject multi-token extension (q_len=1 assert)
+                # Fall through to incremental single-token approach
+                # Rollback the partial extend
+                self.rollback()
+
+        # Fallback 1: incremental single-token extends (for Unsloth compatibility)
+        if self.cache is not None:
+            draft_logits_list = []
+            saved_base = self.base_seq_len
+            try:
+                for i in range(draft_k):
+                    tok = draft_ids[:, i:i+1]
+                    logits = self.extend(tok)  # q_len=1, safe for Unsloth
+                    draft_logits_list.append(logits[:, -1:, :])
+                # Rollback to pre-draft state
+                self.base_seq_len = saved_base
+                self.rollback()
+                return torch.cat(draft_logits_list, dim=1)
+            except (RuntimeError, AssertionError):
+                self.base_seq_len = saved_base
+                self.rollback()
+
+        # Fallback 2: full forward pass (original behavior)
         combined = torch.cat([input_ids, draft_ids], dim=-1)
-        # Full forward pass — no KV cache (avoids unsloth's q_len=1 assert)
         outputs = self.model(
             combined,
             use_cache=True,

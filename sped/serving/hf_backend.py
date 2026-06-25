@@ -41,12 +41,21 @@ class HFBackend(InferenceBackend):
         # Build quantization config
         quantization_kwargs = self._build_quantization_kwargs(config.quantization)
 
+        # Flash Attention 2: enable if flash-attn is installed
+        fa2_kwargs = {}
+        try:
+            import flash_attn  # noqa: F401
+            fa2_kwargs["attn_implementation"] = "flash_attention_2"
+        except ImportError:
+            pass
+
         self._model = AutoModelForCausalLM.from_pretrained(
             config.model_id,
             torch_dtype=torch_dtype,
             device_map=self._device,
             trust_remote_code=True,
             **quantization_kwargs,
+            **fa2_kwargs,
         )
         self._model.eval()
 

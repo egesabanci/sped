@@ -20,6 +20,19 @@ from pathlib import Path
 from typing import Optional, Tuple, Any
 
 
+def _flash_attn_kwargs() -> dict:
+    """Return kwargs to enable Flash Attention 2 if available.
+
+    Checks whether ``flash_attn`` is installed before requesting FA2,
+    so the call doesn't error out on systems without it.
+    """
+    try:
+        import flash_attn  # noqa: F401
+        return {"attn_implementation": "flash_attention_2"}
+    except ImportError:
+        return {}
+
+
 def _cache_dir_for(model_name: str, max_seq_length: Optional[int] = None) -> str:
     """Compute the 4-bit cache directory for a model.
 
@@ -64,14 +77,17 @@ def load_unsloth_model(
     """
     from unsloth import FastLanguageModel  # noqa: WPS433
 
+    # Common kwargs shared across all model loads
+    fa2_kwargs = _flash_attn_kwargs()
+
     if not load_in_4bit:
-        # Full precision load (bf16) — no caching needed
         return FastLanguageModel.from_pretrained(
             model_name=model_name,
             max_seq_length=max_seq_length,
             dtype=dtype,
             load_in_4bit=False,
             device_map=device,
+            **fa2_kwargs,
         )
 
     cache_path = _cache_dir_for(
@@ -89,6 +105,7 @@ def load_unsloth_model(
             dtype=dtype,
             load_in_4bit=True,
             device_map=device,
+            **fa2_kwargs,
         )
 
     if cache.exists():
@@ -100,6 +117,7 @@ def load_unsloth_model(
             dtype=dtype,
             load_in_4bit=True,
             device_map=device,
+            **fa2_kwargs,
         )
 
     if verbose:
@@ -110,6 +128,7 @@ def load_unsloth_model(
         dtype=dtype,
         load_in_4bit=True,
         device_map=device,
+        **fa2_kwargs,
     )
     # Persist the quantized weights for fast reload next time
     try:
