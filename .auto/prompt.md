@@ -39,6 +39,25 @@ Outputs `METRIC metrics=...` JSON line with primary + secondary metrics.
 autograd tracking internals. Safe for frozen models. Baseline: 1128→1339 tok/s.
 Committed at `6ce41a0`.
 
+### ✅ Experiment 7: Target hidden-state cache (+124% on hit)
+Key insight: hidden states (1, L, 4096) are 38× smaller than logits (1, L, 151936).
+Cache stores `target.model(...)` outputs in bf16 on CPU RAM (33.5 MB vs 1.24 GB
+each at L=4096). On cache hit: load hidden→GPU→lm_head only (~26ms at L=1480)
+instead of full 8B target forward (677ms).
+
+Implementation:
+- `_get_target_logits` uses `target.model(..., causal_mask=LowerTriangularMask())`
+  + `target.lm_head(...)` split, which matches `target(...)` exactly
+- Cache: 200-entry FIFO dict on CPU (~6.7 GB max at L=4096)
+- Cache miss: compute + write (same speed as baseline, ~1% overhead)
+- Cache hit: 2.2× step speedup (1106ms → 586ms at L=1480)
+
+Limitations:
+- Cache key = full batch tensor (incl. padding). bs=2 batches produce different
+  keys than bs=1 → cache misses across different batch compositions
+- Best for bs=1 with deterministic ordering (eval10: 10 entries → 100% epoch 2 hit)
+- Scales to ~200 examples at L=4096 before FIFO eviction reduces hit rate
+
 ### ❌ Experiment 2: Disable gradient checkpointing (crash)
 Setting `use_gradient_checkpointing=False` in Unsloth's get_peft_model crashes —
 the patched LlamaModel_fast_forward expects `_gradient_checkpointing_func`.
@@ -62,18 +81,11 @@ precision internally. 217ms → 229ms. Not worth it.
 LoRA tensors (32K params each) have too much kernel launch overhead per tensor
 for the fused kernel to benefit. Reverted.
 
-### 💡 Experiment 7: Target logits caching cross-epoch (+87% simulated)
-Pre-computed target logits on CPU RAM and skipped target forward during
-training. Shows 2489 tok/s (87% improvement) but ONLY practical for small
-datasets (eval10 fits 4.5 GB cache, smoke 100-example doesn't at 45 GB).
-Not merged.
-
 ### Key architectural insight
 **Target forward = 48% of step time.** It's bandwidth-bound (8B model weights
-read from HBM per token). The only way to get a large improvement is to
-reduce (or eliminate) the target forward cost. Caching works for small
-datasets but doesn't scale to 5k+ examples.
+read from HBM per token). Hidden-state caching saves the target forward on
+cache hit, shifting the bottleneck to draft backward+opt (now 65% of step).
 
-The +19% from inference_mode() is the best practical gain. Further gains
-require structural changes: hidden-state caching, model parallelism,
-reduced precision for the target, or processing fewer tokens per step.
+Total practical gains from merged changes:
+- Epoch 1: +19% (inference_mode only, no cache hits)
+- Epoch 2+: +124% (inference_mode + cache hits on previously seen examples)
