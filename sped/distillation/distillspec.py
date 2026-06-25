@@ -261,7 +261,7 @@ class DistillSpec:
         speedup on the frozen target forward.
         """
         # bf16 autocast on frozen target forward (#98)
-        with torch.no_grad(), torch.autocast(
+        with torch.inference_mode(), torch.autocast(
             "cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available(),
         ):
             target_outputs = self.target_model(input_ids, attention_mask=attention_mask)
