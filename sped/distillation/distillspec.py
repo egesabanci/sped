@@ -727,8 +727,10 @@ class DistillSpec:
         reduces peak memory proportionally (e.g. 512/1480 = 35%).
         """
         B, L, V = student_logits.shape
-        # Chunk over sequence dimension to limit peak fp32 memory
-        per_token_kl_parts = []
+        # Pre-allocate output to avoid torch.cat overhead
+        per_token_kl = torch.zeros(
+            B, L, device=student_logits.device, dtype=torch.float32,
+        )
         for start in range(0, L, chunk_size):
             end = min(start + chunk_size, L)
             slp = torch.log_softmax(
@@ -738,9 +740,9 @@ class DistillSpec:
                 teacher_logits[:, start:end] / temperature, dim=-1,
             )
             tp = tlp.exp()
-            part_kl = (tp * (tlp - slp)).sum(dim=-1)  # (B, chunk)
-            per_token_kl_parts.append(part_kl)
-        per_token_kl = torch.cat(per_token_kl_parts, dim=1)  # (B, L)
+            per_token_kl[:, start:end] = (
+                tp * (tlp - slp)
+            ).sum(dim=-1)  # (B, chunk)
         # Mask out padding positions if attention_mask is provided
         if attention_mask is not None:
             per_token_kl = per_token_kl * attention_mask.float()
