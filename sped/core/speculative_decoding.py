@@ -140,20 +140,22 @@ class SpeculativeDecoder:
 
             # ── Step 1: Draft model proposes K tokens ────────────────
             proposed_draft = []
+            proposed_draft_logits_list = []
             for _ in range(draft_k):
                 if self.draft_cache is not None and self.draft_cache.is_full:
                     break
-                ctx_tensor = torch.tensor([draft_ctx_ids], device=self.device) if self.draft_cache is None else None
                 if self.draft_cache is not None:
                     with torch.no_grad():
-                        logits = self.draft_cache.extend(ctx_tensor[:, -1:] if ctx_tensor is not None else
-                                                         torch.tensor([[draft_ctx_ids[-1]]], device=self.device))
+                        logits = self.draft_cache.extend(
+                            torch.tensor([[draft_ctx_ids[-1]]], device=self.device)
+                        )
                 else:
                     with torch.no_grad():
                         outputs = self.draft_model(torch.tensor([draft_ctx_ids], device=self.device))
                         logits = outputs.logits[:, -1:, :]
 
                 next_logits = logits[0, -1, :]
+                proposed_draft_logits_list.append(logits)  # save for step 4
                 if temperature > 0:
                     probs = torch.softmax(next_logits / temperature, dim=-1)
                     next_token = torch.multinomial(probs, 1).item()
@@ -242,14 +244,11 @@ class SpeculativeDecoder:
                 _skip_standard_rejection = False
 
             if not _skip_standard_rejection:
-                if self.draft_cache is not None and self.vocab_aligner is None:
-                    # Same vocab with draft cache
-                    draft_ctx = torch.tensor([draft_ctx_ids], device=self.device)
-                    with torch.no_grad():
-                        draft_output = self.draft_model(draft_ctx)
-                    draft_logits = draft_output.logits[0, -(len(proposed_draft) + 1):-1, :]
+                # Use saved draft logits from proposal loop (no redundant forward)
+                if proposed_draft_logits_list:
+                    draft_logits = torch.cat(proposed_draft_logits_list, dim=1)[0]  # (K, vocab)
                 else:
-                    draft_logits = target_logits_for_draft.clone()
+                    draft_logits = target_logits_for_draft.clone()[0]
 
                 # ── Step 4: Rejection sampling ──────────────────────────
                 n_verify = min(aligned_draft.shape[-1], draft_logits.shape[0], target_logits_for_draft.shape[1])
