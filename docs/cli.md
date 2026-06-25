@@ -85,7 +85,7 @@ Run inference with speculative decoding.
 | `--target` | `-t` | required | Target model ID or path |
 | `--draft` | `-d` | none | Draft model (omit for standard mode) |
 | `--draft-lora` | | none | Path to LoRA adapter |
-| `--backend` | `-b` | `auto` | Backend: auto, hf, mlx, vllm |
+| `--backend` | `-b` | `auto` | Backend: auto, hf, mlx, vllm, unsloth |
 | `--align` | | `auto` | Alignment: auto, none, string, probabilistic, hybrid |
 | `--draft-k` | `-k` | `5` | Draft tokens per step (1–20) |
 | `--temperature` | `-T` | `0.0` | Sampling temperature |

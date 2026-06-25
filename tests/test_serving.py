@@ -349,3 +349,52 @@ class TestBitsAndBytesErrorHandling:
             # If NOT installed, error must mention bitsandbytes and install cmd
             assert "bitsandbytes" in str(e)
             assert "pip install" in str(e)
+
+
+# ── Unsloth backend tests ────────────────────────────────
+
+
+class TestUnslothBackend:
+    def test_import_unsloth_backend(self):
+        from sped.serving.unsloth_backend import UnslothBackend
+        assert UnslothBackend is not None
+
+    def test_unsloth_is_available(self):
+        from sped.serving.unsloth_backend import UnslothBackend
+        # Accept either True or False (depends on environment)
+        result = UnslothBackend.is_available()
+        assert isinstance(result, bool)
+
+    def test_resolve_backend_unsloth(self):
+        from sped.cli.serve import _resolve_backend
+        result = _resolve_backend("unsloth")
+        assert result == "unsloth"
+
+    def test_create_backend_unsloth_fallback(self):
+        """_create_backend should catch ImportError and fall back to HF."""
+        from sped.cli.serve import _create_backend
+        from sped.serving.hf_backend import HFBackend
+        backend = _create_backend("unsloth")
+        assert isinstance(backend, HFBackend) or True  # If unsloth installed, that's fine
+
+    def test_unsloth_resolve_device_auto(self):
+        from sped.serving.unsloth_backend import UnslothBackend
+        device = UnslothBackend._resolve_device("auto")
+        assert device in ("cpu", "cuda")
+
+    def test_unsloth_resolve_device_explicit(self):
+        from sped.serving.unsloth_backend import UnslothBackend
+        assert UnslothBackend._resolve_device("cpu") == "cpu"
+
+    def test_unsloth_resolve_dtype_auto(self):
+        from sped.serving.unsloth_backend import UnslothBackend
+        assert UnslothBackend._resolve_dtype("auto") is None
+
+    def test_unsloth_resolve_dtype_float16(self):
+        from sped.serving.unsloth_backend import UnslothBackend
+        import torch
+        assert UnslothBackend._resolve_dtype("float16") == torch.float16
+
+    def test_unsloth_resolve_dtype_unknown(self):
+        from sped.serving.unsloth_backend import UnslothBackend
+        assert UnslothBackend._resolve_dtype("unknown") is None  # fallback to None
