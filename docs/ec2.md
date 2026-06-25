@@ -180,6 +180,31 @@ rm -rf ~/.cache/huggingface/hub/models--*--*/
 sudo chown -R ubuntu:ubuntu ~/.cache ~/.sped
 ```
 
+## Reference Benchmarks
+
+Below is a template for recording benchmark results on EC2. Fill in your actual results after testing.
+
+| Draft | Target | Device | Tok/s (Spec) | Tok/s (Std) | Speedup | VRAM |
+|-------|--------|--------|-------------|-------------|---------|------|
+| `Qwen3-0.6B` | `Qwen3-0.6B` | A10G | — | — | — | — |
+| `Qwen3-0.6B` | `Qwen3-4B` | A10G | — | — | — | — |
+| `Qwen3-0.6B` | `Qwen3-4B-AWQ` | A10G | — | — | — | — |
+| `Qwen3-0.6B` | `Qwen3.5-2B` | A10G | — | — | — | — |
+
+To generate a benchmark:
+
+```bash
+sped serve run \
+  --target <target_model> \
+  --draft <draft_model> \
+  --device cuda \
+  --benchmark \
+  --max-new-tokens 32 \
+  --output json
+```
+
+Results are saved to `benchmark_results.json`. Use `--output json` for machine-parseable output.
+
 ## Security Notes
 
 - Run as a non-root user (e.g., `ubuntu`)

@@ -14,7 +14,7 @@ VALID_BACKENDS = {"auto", "hf", "mlx", "vllm"}
 VALID_ALIGNMENTS = {"auto", "none", "string", "probabilistic", "hybrid"}
 VALID_OUTPUT_FORMATS = {"text", "json", "silent"}
 VALID_LOG_LEVELS = {"debug", "info", "warn", "error"}
-VALID_QUANTIZATIONS = {None, "4bit", "8bit", "awq", "gptq"}
+VALID_DTYPES = {"auto", "float16", "bfloat16", "float32"}
 
 
 def validate_draft_k(value: int) -> int:
@@ -85,6 +85,16 @@ def validate_align(value: str) -> str:
         raise ValueError(
             f"Invalid --align: '{value}'. Must be one of: "
             f"{', '.join(sorted(VALID_ALIGNMENTS))}."
+        )
+    return value
+
+
+def validate_dtype(value: str) -> str:
+    """Validate dtype string."""
+    if value not in VALID_DTYPES:
+        raise ValueError(
+            f"Invalid --dtype: '{value}'. Must be one of: "
+            f"{', '.join(sorted(VALID_DTYPES))}."
         )
     return value
 

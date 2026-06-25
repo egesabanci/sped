@@ -228,3 +228,129 @@ class TestCoreImports:
         from sped.core import DraftTree, TreeNode
         assert DraftTree is not None
         assert TreeNode is not None
+
+
+# ── Cross-vocab end-to-end tests ─────────────────────────
+
+
+class TestCrossVocabSpeculation:
+    """Test SpeculativeDecoder with a VocabAligner (cross-vocab path).
+
+    Uses tiny random models so it runs fast. Validates that the
+    cross-vocab speculate loop completes without hanging.
+    """
+
+    @pytest.fixture
+    def models(self):
+        from transformers import (
+            AutoModelForCausalLM, AutoTokenizer,
+        )
+        model_id = "hf-internal-testing/tiny-random-GPTNeoXForCausalLM"
+        tok = AutoTokenizer.from_pretrained(model_id)
+        tok.pad_token = tok.eos_token
+        model = AutoModelForCausalLM.from_pretrained(model_id)
+        model.eval()
+        return model, tok
+
+    def test_cross_vocab_generates_successfully(self, models):
+        """SpeculativeDecoder with VocabAligner should generate text
+        without hanging or crashing (regression test for PR #43)."""
+        from sped.core.speculative_decoding import SpeculativeDecoder
+        from sped.vocab_agnostic.alignment import VocabAligner
+
+        model, tok = models
+        # Same model for both draft and target (same vocab, so VocabAligner
+        # just passes through — but it exercises the cross-vocab code path)
+        aligner = VocabAligner(
+            target_tokenizer=tok,
+            draft_tokenizer=tok,
+            strategy="string",
+            target_model=model,
+        )
+        decoder = SpeculativeDecoder(
+            target_model=model, target_tokenizer=tok,
+            draft_model=model, draft_tokenizer=tok,
+            vocab_aligner=aligner,
+            max_draft_tokens=3, device="cpu",
+        )
+
+        result = decoder.generate("Hello", max_new_tokens=5, temperature=0.0)
+        assert isinstance(result, str)
+        assert len(result) > 0
+        metrics = decoder.get_metrics()
+        assert metrics["total_steps"] > 0
+
+    def test_cross_vocab_hybrid_strategy(self, models):
+        """Hybrid alignment should also work through the decoder."""
+        from sped.core.speculative_decoding import SpeculativeDecoder
+        from sped.vocab_agnostic.alignment import VocabAligner
+
+        model, tok = models
+        aligner = VocabAligner(
+            target_tokenizer=tok,
+            draft_tokenizer=tok,
+            strategy="hybrid",
+            target_model=model,
+        )
+        decoder = SpeculativeDecoder(
+            target_model=model, target_tokenizer=tok,
+            draft_model=model, draft_tokenizer=tok,
+            vocab_aligner=aligner,
+            max_draft_tokens=2, device="cpu",
+        )
+
+        result = decoder.generate("test", max_new_tokens=3, temperature=0.0)
+        assert isinstance(result, str)
+        assert len(result) > 0
+
+    def test_cross_vocab_probabilistic_strategy(self, models):
+        """Probabilistic alignment with target model scoring."""
+        from sped.core.speculative_decoding import SpeculativeDecoder
+        from sped.vocab_agnostic.alignment import VocabAligner
+
+        model, tok = models
+        aligner = VocabAligner(
+            target_tokenizer=tok,
+            draft_tokenizer=tok,
+            strategy="probabilistic",
+            target_model=model,
+        )
+        decoder = SpeculativeDecoder(
+            target_model=model, target_tokenizer=tok,
+            draft_model=model, draft_tokenizer=tok,
+            vocab_aligner=aligner,
+            max_draft_tokens=2, device="cpu",
+        )
+
+        result = decoder.generate("test", max_new_tokens=3, temperature=0.0)
+        assert isinstance(result, str)
+        assert len(result) > 0
+
+    def test_cross_vocab_aligner_fallback(self, models):
+        """When align() raises an exception, decoder should fall back
+        gracefully instead of crashing."""
+        from sped.core.speculative_decoding import SpeculativeDecoder
+        from sped.vocab_agnostic.alignment import VocabAligner
+
+        model, tok = models
+        # Create an aligner that will fail on align()
+        class _FailingAligner(VocabAligner):
+            def align(self, *args, **kwargs):
+                raise RuntimeError("Intentional align failure")
+
+        fail_aligner = _FailingAligner(
+            target_tokenizer=tok,
+            draft_tokenizer=tok,
+            strategy="string",
+            target_model=model,
+        )
+        decoder = SpeculativeDecoder(
+            target_model=model, target_tokenizer=tok,
+            draft_model=model, draft_tokenizer=tok,
+            vocab_aligner=fail_aligner,
+            max_draft_tokens=2, device="cpu",
+        )
+
+        result = decoder.generate("test", max_new_tokens=3, temperature=0.0)
+        assert isinstance(result, str)
+        assert len(result) > 0

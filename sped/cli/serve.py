@@ -46,6 +46,7 @@ from sped.utils.validation import (
     validate_draft_k_against_max,
     validate_model_id,
     validate_timeout,
+    validate_dtype,
 )
 from sped.utils.logging import setup_logging, get_logger, log_model_info, log_generation_result, close_json_output
 from sped.utils.output import print_results, save_results_json
@@ -93,6 +94,7 @@ def run(
     results_dir: Optional[Path] = typer.Option(None, "--results-dir", help="Directory to save generation results"),
     timeout: Optional[int] = typer.Option(None, "--timeout", help="Max seconds for generation"),
     seed: Optional[int] = typer.Option(None, "--seed", help="Random seed for reproducibility"),
+    dtype: str = typer.Option("auto", "--dtype", help="Model dtype: auto, float16, bfloat16, float32"),
 ):
     """Run inference with speculative decoding."""
     import torch
@@ -108,6 +110,7 @@ def run(
         validate_output_format(output)
         validate_log_level(log_level)
         validate_model_id(target)
+        validate_dtype(dtype)
         if draft:
             validate_model_id(draft)
         if timeout is not None:
@@ -149,7 +152,7 @@ def run(
     logger.info(f"Loading target model: {target}")
     try:
         target_backend = _create_backend(resolved_backend)
-        target_backend.load_model(BackendConfig(model_id=target, device=device, quantization=quantization))
+        target_backend.load_model(BackendConfig(model_id=target, device=device, dtype=dtype, quantization=quantization))
         target_model = target_backend.model
         target_tokenizer = target_backend.tokenizer
         log_model_info(
@@ -170,6 +173,7 @@ def run(
             draft_backend.load_model(BackendConfig(
                 model_id=draft if draft_lora is None else str(draft_lora),
                 device=device,
+                dtype=dtype,
                 quantization=quantization,
             ))
             draft_model = draft_backend.model
@@ -272,8 +276,13 @@ def _resolve_backend(backend: str, has_draft: bool = False) -> str:
 
 def _create_backend(backend: str):
     if backend == "mlx":
-        from sped.serving.mlx_backend import MLXBackend
-        return MLXBackend()
+        try:
+            from sped.serving.mlx_backend import MLXBackend
+            return MLXBackend()
+        except ImportError:
+            logger = get_logger()
+            logger.warning("MLX not available (Apple Silicon only). Falling back to HF.")
+            return HFBackend()
     elif backend == "vllm":
         try:
             from sped.serving.vllm_backend import VLLMBackend
