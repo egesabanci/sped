@@ -94,7 +94,7 @@ def run(
     target: str = typer.Option(..., "--target", "-t", help="Target model ID or path"),
     draft: Optional[str] = typer.Option(None, "--draft", "-d", help="Draft model ID or path. Omit for standard autoregressive."),
     draft_lora: Optional[Path] = typer.Option(None, "--draft-lora", help="Path to LoRA adapter", exists=True, file_okay=False, dir_okay=True),
-    backend: str = typer.Option("auto", "--backend", "-b", help="Backend: auto, hf, mlx, vllm"),
+    backend: str = typer.Option("auto", "--backend", "-b", help="Backend: auto, hf, mlx, vllm, unsloth"),
     align: str = typer.Option("auto", "--align", help="Alignment: auto, none, string, probabilistic, hybrid"),
     draft_k: int = typer.Option(5, "--draft-k", "-k", help="Draft tokens per step"),
     temperature: float = typer.Option(0.0, "--temperature", "-T", help="Sampling temperature (0=greedy)"),

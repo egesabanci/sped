@@ -32,6 +32,19 @@ def _is_unsloth_available() -> bool:
         return False
 
 
+def _is_unsloth_model(model) -> bool:
+    """Detect whether *model* was loaded/patched by Unsloth.
+
+    Unsloth-patched models carry internal attributes (e.g.
+    ``_saved_temp_tokenizer``) that standard HF models lack. We use this
+    to avoid routing a plain HF model through the Unsloth LoRA path just
+    because the ``unsloth`` package happens to be installed.
+    """
+    return hasattr(model, "_saved_temp_tokenizer") or any(
+        hasattr(model, attr) for attr in ("_unloth_model", "_unsloth_model")
+    )
+
+
 def _apply_unsloth_lora(model, r: int = 8, lora_alpha: int = 16, **kwargs):
     """Apply LoRA via FastLanguageModel.get_peft_model with fast kernels."""
     from unsloth import FastLanguageModel
@@ -110,10 +123,15 @@ class DistillSpec:
         self.target_tokenizer = target_tokenizer
         self.backend = backend
 
-        # Resolve backend: prefer unsloth if auto and available
+        # Resolve backend: prefer unsloth if auto, available, AND the
+        # model was actually loaded by Unsloth. This avoids routing a
+        # plain HF model through the Unsloth LoRA path just because the
+        # unsloth package is installed in the environment.
         use_unsloth = (
             backend == "unsloth" or (
-                backend == "auto" and _is_unsloth_available()
+                backend == "auto"
+                and _is_unsloth_available()
+                and _is_unsloth_model(draft_model)
             )
         )
 
@@ -199,38 +217,53 @@ class DistillSpec:
             sequences: (batch_size, total_len) — prompt + continuation token IDs.
         """
         self.draft_model.eval()
-        all_sequences = []
+        _ensure_unsloth_inference(self.draft_model)
 
-        with torch.no_grad():
-            for prompt in prompts:
+        if not prompts:
+            return torch.tensor([[]], device=self.device)
+
+        # Resolve the device the model actually lives on — more robust than
+        # trusting self.device when the model was loaded on a different one.
+        try:
+            _gen_device = next(self.draft_model.parameters()).device
+        except (StopIteration, AttributeError):
+            _gen_device = self.device
+
+        # ── Batched generation (#76) ────────────────────────────────
+        # Tokenize all prompts together with left-padding (required for
+        # batch generation — all prompts share a single forward pass).
+        orig_side = getattr(self.draft_tokenizer, "padding_side", "right")
+        self.draft_tokenizer.padding_side = "left"
+        pad_id = self.draft_tokenizer.pad_token_id or 0
+        try:
+            with torch.no_grad():
                 inputs = self.draft_tokenizer(
-                    prompt,
+                    prompts,
                     return_tensors="pt",
+                    padding=True,
                     truncation=True,
                     max_length=max_prompt_length,
-                ).to(self.device)
+                ).to(_gen_device)
 
-                # Generate continuation
                 generated = self.draft_model.generate(
                     **inputs,
                     max_new_tokens=gen_tokens_per_prompt,
                     do_sample=True,
                     temperature=gen_temperature,
                     top_p=0.9,
-                    pad_token_id=self.draft_tokenizer.pad_token_id or 0,
+                    pad_token_id=pad_id,
                 )
-                all_sequences.append(generated[0])
+        finally:
+            self.draft_tokenizer.padding_side = orig_side
 
-        if not all_sequences:
-            return torch.tensor([[]], device=self.device)
-
-        # Pad to same length
-        max_len = max(s.shape[0] for s in all_sequences)
-        padded = torch.stack([
-            torch.cat([s, torch.zeros(max_len - s.shape[0], dtype=torch.long, device=self.device)])
-            for s in all_sequences
-        ])
-        return padded
+        # Strip left padding so each row starts at its real first token.
+        # generated has shape (batch, prompt_len + gen_len); prompt_len may
+        # differ per row only if we hadn't padded, but we did, so all rows
+        # are aligned. We return the full sequences (prompt + continuation).
+        result = generated
+        # Switch back to training mode (unsloth: undo for_inference)
+        _ensure_unsloth_training(self.draft_model)
+        return result
 
     # ── Phase 2: Full Training Loop (#15) ──────────────────────────────
 
@@ -253,6 +286,7 @@ class DistillSpec:
         validation_split: float = 0.05,
         val_prompts: int = 20,
         val_draft_k: int = 5,
+        val_max_new_tokens: int = 32,
         checkpoint_dir: Optional[Path] = None,
         save_every_steps: int = 500,
         log_every_steps: int = 10,
@@ -278,6 +312,8 @@ class DistillSpec:
             validation_split: Fraction of dataset to hold out for validation.
             val_prompts: Number of prompts for acceptance rate validation.
             val_draft_k: Draft K for validation.
+            val_max_new_tokens: Max new tokens generated per validation prompt.
+                Lower values are much faster (default 32 vs the previous 128).
             checkpoint_dir: Directory to save checkpoints.
             save_every_steps: Save checkpoint every N steps.
             log_every_steps: Log metrics every N steps.
@@ -336,10 +372,39 @@ class DistillSpec:
         prompts_for_generation: list[str] = []
 
         # Training loop
+        import time as _time
+        _train_start = _time.time()
+        _total_tokens = 0
+
         for epoch in range(start_epoch, num_epochs):
             self.draft_model.train()
             total_loss = 0.0
             epoch_steps = 0
+            _epoch_start = _time.time()
+
+            # ── Progress bar (#75) ────────────────────────────────
+            _show_bar = accelerator.is_main_process
+            from rich.progress import (
+                Progress as _RichProgress, BarColumn as _BarCol,
+                TextColumn as _TextCol, TimeRemainingColumn as _ETACol,
+                SpinnerColumn as _SpinCol,
+            )
+            bar = _RichProgress(
+                _SpinCol(),
+                _TextCol("[bold]{task.description}"),
+                _BarCol(),
+                _TextCol("{task.completed}/{task.total}"),
+                _ETACol(),
+                _TextCol("| loss={task.fields[loss]:.3f}"),
+                transient=True,
+            ) if _show_bar else None
+            _bar_task = None
+            if bar is not None:
+                bar.__enter__()
+                _bar_task = bar.add_task(
+                    f"Epoch {epoch+1}/{num_epochs}",
+                    total=len(train_loader), loss=0.0,
+                )
 
             for batch in train_loader:
                 with accelerator.accumulate(self.draft_model):
@@ -363,7 +428,7 @@ class DistillSpec:
                             gen_prompts,
                             gen_temperature=on_policy_gen_temp,
                             gen_tokens_per_prompt=on_policy_tokens_per_prompt,
-                            max_length=max_length,
+                            max_prompt_length=max_length,
                         )
 
                     # ── Tokenize ───────────────────────────────────────
@@ -374,6 +439,8 @@ class DistillSpec:
                         truncation=True,
                         max_length=max_length,
                     ).to(accelerator.device)
+                    _batch_tokens = inputs.input_ids.numel()
+                    _total_tokens += _batch_tokens
 
                     # ── Forward through both models ────────────────────
                     with torch.no_grad():
@@ -403,22 +470,37 @@ class DistillSpec:
                     total_loss += loss.item()
                     epoch_steps += 1
                     global_step += 1
+                    if bar is not None and _bar_task is not None:
+                        bar.update(_bar_task, advance=1, loss=loss.item())
 
                     # ── Logging ────────────────────────────────────────
                     if global_step % log_every_steps == 0:
                         lr = scheduler.get_last_lr()[0]
+                        _elapsed = _time.time() - _train_start
+                        _tok_s = _total_tokens / max(_elapsed, 1e-6)
+                        _step_s = global_step / max(_elapsed, 1e-6)
+                        _mem_gb = 0.0
+                        if torch.cuda.is_available():
+                            _mem_gb = torch.cuda.max_memory_allocated() / 1e9
                         accelerator.log(
                             {
                                 "train/loss": loss.item(),
                                 "train/lr": lr,
                                 "train/epoch": epoch + global_step / len(train_loader),
                                 "train/global_step": global_step,
+                                "train/tokens_per_sec": _tok_s,
+                                "train/steps_per_sec": _step_s,
+                                "train/peak_mem_gb": _mem_gb,
                             },
                             step=global_step,
                         )
                         logger.info(
-                            f"Epoch {epoch+1}/{num_epochs} | Step {global_step} | "
-                            f"Loss: {loss.item():.4f} | LR: {lr:.2e}"
+                            f"Epoch {epoch+1}/{num_epochs} | "
+                            f"Step {global_step} | "
+                            f"Loss: {loss.item():.4f} | "
+                            f"{_tok_s:.0f} tok/s | "
+                            f"{_step_s:.2f} step/s | "
+                            f"LR: {lr:.2e}"
                         )
 
                     # ── Checkpointing ──────────────────────────────────
@@ -427,10 +509,35 @@ class DistillSpec:
                         accelerator.save_state(str(ckpt_path))
                         logger.info(f"Checkpoint saved: {ckpt_path}")
 
+            # Close the epoch progress bar before logging/validation
+            if bar is not None:
+                bar.__exit__(None, None, None)
+                bar = None
+
             # End of epoch
             avg_loss = total_loss / max(epoch_steps, 1)
+            _epoch_elapsed = _time.time() - _epoch_start
+            _elapsed = _time.time() - _train_start
+            _tok_s = _total_tokens / max(_elapsed, 1e-6)
+            _mem_gb = 0.0
+            if torch.cuda.is_available():
+                _mem_gb = torch.cuda.max_memory_allocated() / 1e9
+            accelerator.log(
+                {
+                    "train/epoch_loss": avg_loss,
+                    "train/epoch_time_s": _epoch_elapsed,
+                    "train/total_time_s": _elapsed,
+                    "train/tokens_per_sec": _tok_s,
+                    "train/peak_mem_gb": _mem_gb,
+                },
+                step=global_step,
+            )
             logger.info(
-                f"Epoch {epoch+1}/{num_epochs} complete — avg loss: {avg_loss:.4f}"
+                f"Epoch {epoch+1}/{num_epochs} complete — "
+                f"avg loss: {avg_loss:.4f} | "
+                f"{_epoch_elapsed:.1f}s | "
+                f"{_tok_s:.0f} tok/s | "
+                f"peak mem: {_mem_gb:.1f} GB"
             )
 
             # ── End-of-epoch validation (#16) ──────────────────────────
@@ -440,7 +547,8 @@ class DistillSpec:
                     for i in range(min(val_prompts, len(val_dataset)))
                 ]
                 acceptance = self._measure_acceptance_rate(
-                    val_prompts_list, draft_k=val_draft_k, temperature=0.0
+                    val_prompts_list, draft_k=val_draft_k, temperature=0.0,
+                    max_new_tokens=val_max_new_tokens,
                 )
                 accelerator.log(
                     {"val/acceptance_rate": acceptance},
@@ -457,6 +565,24 @@ class DistillSpec:
                 ckpt_path = Path(checkpoint_dir) / f"epoch_{epoch+1}"
                 accelerator.save_state(str(ckpt_path))
 
+        # Final summary
+        _final_elapsed = _time.time() - _train_start
+        _final_tok_s = _total_tokens / max(_final_elapsed, 1e-6)
+        _final_mem_gb = 0.0
+        if torch.cuda.is_available():
+            _final_mem_gb = torch.cuda.max_memory_allocated() / 1e9
+        logger.info(
+            "=" * 60
+        )
+        logger.info(
+            f"Training complete — "
+            f"{_final_elapsed:.1f}s total | "
+            f"{_total_tokens:,} tokens | "
+            f"{_final_tok_s:.0f} tok/s avg | "
+            f"peak mem: {_final_mem_gb:.1f} GB"
+        )
+        logger.info("=" * 60)
+
         # Save final model
         if checkpoint_dir is not None:
             final_path = Path(checkpoint_dir) / "final"
@@ -471,6 +597,7 @@ class DistillSpec:
         prompts: list[str],
         draft_k: int = 5,
         temperature: float = 0.0,
+        max_new_tokens: int = 32,
     ) -> dict:
         """Measure speculative decoding acceptance rate for the current draft.
 
@@ -483,6 +610,9 @@ class DistillSpec:
             prompts: List of prompt strings.
             draft_k: Number of draft tokens per speculation step.
             temperature: Sampling temperature.
+            max_new_tokens: Max tokens generated per prompt (default 32 —
+                sufficient for acceptance estimation; 128 is very slow at
+                long sequence lengths).
 
         Returns:
             Dictionary with acceptance metrics.
@@ -505,7 +635,7 @@ class DistillSpec:
         for prompt in prompts:
             decoder.generate(
                 prompt=prompt,
-                max_new_tokens=128,
+                max_new_tokens=max_new_tokens,
                 temperature=temperature,
                 verbose=False,
             )
@@ -518,9 +648,12 @@ class DistillSpec:
         prompts: list[str],
         draft_k: int = 5,
         temperature: float = 0.0,
+        max_new_tokens: int = 32,
     ) -> float:
         """Quick acceptance rate measurement (returns single float)."""
-        metrics = self.measure_acceptance_rate(prompts, draft_k, temperature)
+        metrics = self.measure_acceptance_rate(
+            prompts, draft_k, temperature, max_new_tokens=max_new_tokens,
+        )
         return metrics.get("acceptance_rate", 0.0)
 
     @staticmethod

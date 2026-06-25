@@ -179,7 +179,7 @@ class TestBackendResolution:
         from sped.cli.serve import _resolve_backend
 
         result = _resolve_backend("auto")
-        assert result in ("hf", "mlx", "vllm")
+        assert result in ("hf", "mlx", "vllm", "unsloth")
 
     def test_create_hf_backend(self):
         from sped.cli.serve import _create_backend

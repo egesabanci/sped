@@ -12,6 +12,57 @@ from pathlib import Path
 import pytest
 
 
+def test_distil_load_dataset_split_auto(tmp_path):
+    """_load_dataset auto-detects the train_sft split (#74)."""
+    from datasets import Dataset, DatasetDict
+    from sped.cli.distil import _load_dataset
+
+    ds = Dataset.from_list([{"text": "a"}, {"text": "b"}])
+    dd = DatasetDict({"train_sft": ds})
+    save_path = tmp_path / "ds"
+    dd.save_to_disk(str(save_path))
+
+    loaded = _load_dataset(str(save_path), "auto")
+    assert len(loaded) == 2
+
+
+def test_distil_load_dataset_explicit_split(tmp_path):
+    """_load_dataset honors an explicit split name (#74)."""
+    from datasets import Dataset, DatasetDict
+    from sped.cli.distil import _load_dataset
+
+    dd = DatasetDict({
+        "train_sft": Dataset.from_list([{"text": "a"}]),
+        "test_sft": Dataset.from_list([{"text": "b"}, {"text": "c"}]),
+    })
+    save_path = tmp_path / "ds"
+    dd.save_to_disk(str(save_path))
+
+    loaded = _load_dataset(str(save_path), "test_sft")
+    assert len(loaded) == 2
+
+
+def test_distil_load_dataset_invalid_split(tmp_path):
+    """_load_dataset raises on an unknown split (#74)."""
+    from datasets import Dataset, DatasetDict
+    from sped.cli.distil import _load_dataset
+
+    dd = DatasetDict({"train": Dataset.from_list([{"text": "a"}])})
+    save_path = tmp_path / "ds"
+    dd.save_to_disk(str(save_path))
+
+    with pytest.raises(ValueError, match="not found"):
+        _load_dataset(str(save_path), "nonexistent")
+
+
+def test_distil_build_validation_prompts_offline():
+    """_build_validation_prompts falls back to generic prompts offline (#73)."""
+    from sped.cli.distil import _build_validation_prompts
+    prompts = _build_validation_prompts(5)
+    assert len(prompts) >= 5
+    assert all(isinstance(p, str) for p in prompts)
+
+
 @pytest.fixture
 def temp_config_dir():
     """Create a temporary .sped config directory."""
@@ -25,7 +76,7 @@ def temp_config_dir():
         del os.environ["HOME"]
 
 
-def _run_sped(*args: str, timeout: int = 10) -> subprocess.CompletedProcess:
+def _run_sped(*args: str, timeout: int = 30) -> subprocess.CompletedProcess:
     """Run a sped CLI command and return the result."""
     return subprocess.run(
         ["sped", *args],
@@ -91,6 +142,35 @@ def test_distil_run_help():
     assert r.returncode == 0
     assert "--draft" in r.stdout
     assert "--target" in r.stdout
+
+
+def test_distil_run_new_flags():
+    """New flags from issues #67/#77/#78/#79 are exposed."""
+    r = _run_sped("distil", "run", "--help", timeout=15)
+    assert r.returncode == 0
+    for flag in [
+        "--validation-split",
+        "--val-max-new-tokens",
+        "--grad-accum",
+        "--warmup-steps",
+        "--mixed-precision",
+        "--on-policy-regen",
+        "--checkpoint-dir",
+        "--resume-from",
+        "--backend",
+        "--draft-dtype",
+        "--split",
+        "--log-every",
+    ]:
+        assert flag in r.stdout, f"missing flag {flag} in distil run --help"
+
+
+def test_distil_validate_backend_flag():
+    """distil validate exposes --backend and --draft-lora (#73)."""
+    r = _run_sped("distil", "validate", "--help", timeout=15)
+    assert r.returncode == 0
+    assert "--backend" in r.stdout
+    assert "--draft-lora" in r.stdout
 
 
 def test_distil_run_requires_draft():

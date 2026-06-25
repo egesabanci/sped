@@ -70,12 +70,15 @@ class UnslothBackend(InferenceBackend):
         torch_dtype = self._resolve_dtype(config.dtype)
 
         try:
-            model, self._tokenizer = FastLanguageModel.from_pretrained(
-                model_name=config.model_id,
+            # Use shared 4-bit caching utility (#80): quantizes once,
+            # saves a ``{model}-4bit-cache`` for fast reload (~26s vs ~132s).
+            from sped.utils.unsloth_cache import load_unsloth_model
+            model, self._tokenizer = load_unsloth_model(
+                config.model_id,
                 max_seq_length=config.max_length,
-                dtype=torch_dtype,
                 load_in_4bit=True,
-                device_map=self._device,
+                device=self._device,
+                dtype=torch_dtype,
             )
         except RuntimeError as e:
             error_msg = str(e).lower()
@@ -87,6 +90,15 @@ class UnslothBackend(InferenceBackend):
             raise RuntimeError(
                 f"Failed to load model '{config.model_id}' with Unsloth: {e}"
             ) from e
+        except ImportError:
+            # Fall back to direct loading if the utility import fails
+            model, self._tokenizer = FastLanguageModel.from_pretrained(
+                model_name=config.model_id,
+                max_seq_length=config.max_length,
+                dtype=torch_dtype,
+                load_in_4bit=True,
+                device_map=self._device,
+            )
 
         # Enable fast inference kernels
         FastLanguageModel.for_inference(model)

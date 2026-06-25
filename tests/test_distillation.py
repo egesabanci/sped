@@ -130,6 +130,35 @@ class TestOnPolicyGeneration:
         )
         assert sequences is not None
 
+    def test_generate_on_policy_batched_shape(self):
+        """Batched on-policy generation returns one row per prompt (#76)."""
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from sped.distillation.distillspec import DistillSpec
+
+        model_id = "hf-internal-testing/tiny-random-GPTNeoXForCausalLM"
+        model = AutoModelForCausalLM.from_pretrained(model_id)
+        tokenizer = AutoTokenizer.from_pretrained(model_id)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+
+        distiller = DistillSpec(
+            draft_model=model,
+            draft_tokenizer=tokenizer,
+            target_model=model,
+            target_tokenizer=tokenizer,
+            lora_rank=4,
+        )
+
+        prompts = ["Hello world", "Another test", "Third prompt"]
+        sequences = distiller._generate_on_policy(
+            prompts,
+            gen_temperature=0.7,
+            gen_tokens_per_prompt=5,
+        )
+        # Batched: one row per prompt, all same length (left-padded)
+        assert sequences.shape[0] == len(prompts)
+        assert sequences.shape[1] > 0
+
 
 # ── Training Loop Tests (#15) ────────────────────────────
 
@@ -170,6 +199,32 @@ class TestTrainingLoop:
             validation_split=0.0,
         )
         assert trained is not None
+
+    def test_distill_accepts_val_max_new_tokens(self):
+        """distill() accepts the val_max_new_tokens parameter (#77)."""
+        import inspect
+        from sped.distillation.distillspec import DistillSpec
+        sig = inspect.signature(DistillSpec.distill)
+        assert "val_max_new_tokens" in sig.parameters
+        assert sig.parameters["val_max_new_tokens"].default == 32
+
+    def test_measure_acceptance_rate_accepts_max_new_tokens(self):
+        """measure_acceptance_rate accepts max_new_tokens (#77)."""
+        import inspect
+        from sped.distillation.distillspec import DistillSpec
+        sig = inspect.signature(DistillSpec.measure_acceptance_rate)
+        assert "max_new_tokens" in sig.parameters
+        assert sig.parameters["max_new_tokens"].default == 32
+
+    def test_distill_accepts_checkpoint_and_resume_params(self):
+        """distill() exposes checkpoint_dir and resume_from (#79)."""
+        import inspect
+        from sped.distillation.distillspec import DistillSpec
+        sig = inspect.signature(DistillSpec.distill)
+        assert "checkpoint_dir" in sig.parameters
+        assert "resume_from" in sig.parameters
+        assert "gradient_accumulation_steps" in sig.parameters
+        assert "mixed_precision" in sig.parameters
 
 
 # ── Validation Tests (#16) ───────────────────────────────
