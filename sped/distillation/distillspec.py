@@ -198,11 +198,11 @@ class DistillSpec:
         """Tokenize entire dataset once before training using batched tokenization."""
         import time as _t
         t0 = _t.time()
+        _tokenizer = self.draft_tokenizer  # capture for closure
 
-        # Batched tokenization via dataset.map (much faster than per-example loop)
         def _tokenize_batch(examples):
-            texts = examples.get(text_column, [""]) if isinstance(examples, dict) else examples
-            encoded = self.draft_tokenizer(
+            texts = examples[text_column]
+            encoded = _tokenizer(
                 texts, truncation=True, max_length=max_length, padding=False,
             )
             return {"input_ids": encoded["input_ids"]}
@@ -213,7 +213,6 @@ class DistillSpec:
             desc="Tokenizing",
         )
 
-        # Convert to list of dicts for the DataLoader
         tokenized = [
             {"input_ids": torch.tensor(ids)}
             for ids in tokenized_ds["input_ids"]
