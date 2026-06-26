@@ -195,19 +195,30 @@ class DistillSpec:
     # ── Pre-tokenized dataset cache (#99) ─────────────────────────────
 
     def _tokenize_dataset(self, dataset, text_column: str, max_length: int) -> list[dict]:
-        """Tokenize entire dataset once before training."""
+        """Tokenize entire dataset once before training using batched tokenization."""
         import time as _t
         t0 = _t.time()
-        tokenized = []
-        for i in range(len(dataset)):
-            item = dataset[i]
-            text = item.get(text_column, "") if isinstance(item, dict) else str(item)
-            if not text:
-                continue
+
+        # Batched tokenization via dataset.map (much faster than per-example loop)
+        def _tokenize_batch(examples):
+            texts = examples.get(text_column, [""]) if isinstance(examples, dict) else examples
             encoded = self.draft_tokenizer(
-                text, truncation=True, max_length=max_length, return_tensors="pt",
+                texts, truncation=True, max_length=max_length, padding=False,
             )
-            tokenized.append({"input_ids": encoded.input_ids[0]})
+            return {"input_ids": encoded["input_ids"]}
+
+        tokenized_ds = dataset.map(
+            _tokenize_batch, batched=True, batch_size=1000,
+            remove_columns=dataset.column_names,
+            desc="Tokenizing",
+        )
+
+        # Convert to list of dicts for the DataLoader
+        tokenized = [
+            {"input_ids": torch.tensor(ids)}
+            for ids in tokenized_ds["input_ids"]
+        ]
+
         elapsed = _t.time() - t0
         logger.info(f"Pre-tokenized {len(tokenized)} examples in {elapsed:.1f}s")
         return tokenized
